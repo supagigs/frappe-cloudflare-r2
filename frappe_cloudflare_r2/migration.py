@@ -124,7 +124,9 @@ def run_batch(state, after, batch_no):
 			if result == "migrated" and direction == "local_to_r2" and settings.delete_local_after_upload:
 				_remove(local_path(row.file_url))
 
-		_rewrite_references(state["run_id"], batch_no, rewrite_text=cint(settings.rewrite_text_links))
+		# S3 links are always rewritten: once frappe_s3_attachment is uninstalled they stop resolving
+		rewrite_text = cint(settings.rewrite_text_links) or direction == "s3_to_r2"
+		_rewrite_references(state["run_id"], batch_no, rewrite_text=rewrite_text)
 		# end of batch: persist the re-pointed references before the next job is queued
 		frappe.db.commit()  # nosemgrep
 	except Exception:

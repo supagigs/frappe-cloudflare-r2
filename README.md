@@ -41,7 +41,7 @@ from local disk or the <a href="https://cloud.frappe.io/marketplace/apps/frappe_
 | **Private files** | Served through Frappe: the user's File permission is checked, then they are redirected to a signed URL that expires after 2 minutes (configurable). |
 | **Deletion** | Deleting a File in Frappe moves the object to a `_trash/` prefix in R2. A daily job permanently deletes it after **30 days** (configurable, `0` = immediately). |
 | **Local → R2** | One click. Background, batched, resumable. Server copies are deleted after upload. |
-| **S3 → R2** | One click. Reads settings from Frappe S3 Attachment automatically (editable). S3 originals are kept **30 days** (configurable), then deleted. Old S3 links keep working. |
+| **S3 → R2** | One click. Reads settings from Frappe S3 Attachment automatically (editable). S3 originals are kept **30 days** (configurable), then deleted. Old S3 links stored in Frappe are rewritten. |
 | **References** | File records, every Attach / Attach Image field (all DocTypes, child tables, custom fields, Single settings like the website logo) and optionally links inside rich text are updated. |
 | **Content access** | Code that reads file bytes (email attachments, Data Import, Prepared Reports) keeps working for files in R2. |
 | **Exit path** | One click moves everything back to the server disk. |
@@ -108,7 +108,7 @@ Files attached to DocTypes listed in **Keep Local for DocTypes** (default `Data 
 5. Click **Migrate S3 Files → R2**. Each object is streamed from S3 to R2 (multipart for large files), File records and all Attach fields are re-pointed, and every file gets a row in the *Migration Log*.
 6. When it finishes: `bench --site your.site uninstall-app frappe_s3_attachment`.
 
-**Old links keep working.** URLs like `/api/method/frappe_s3_attachment.controller.generate_file?key=...` that are still embedded in sent emails, comments or print formats are answered by this app and redirected to the R2 copy, with permissions checked.
+**Links are updated.** Old S3 links stored inside Frappe (attachment fields, notes, comments, communications, web pages) are rewritten to the R2 copies automatically. Links in emails already sent outside Frappe point to the S3 app and stop working once it is uninstalled.
 
 **S3 retention.** S3 originals are kept for **Keep S3 Originals For (days)** (default 30) as a rollback window, then deleted by a daily job. Set `0` to never delete them. Objects that are still referenced by a File record are never deleted. The S3 key needs `s3:DeleteObject` for this; otherwise the deletion is logged and skipped.
 

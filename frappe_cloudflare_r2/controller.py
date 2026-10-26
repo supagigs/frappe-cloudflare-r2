@@ -10,9 +10,7 @@ from frappe import _
 
 from frappe_cloudflare_r2.storage import (
 	DEFAULT_IGNORED_DOCTYPES,
-	LEGACY_S3_METHOD,
 	R2,
-	S3Source,
 	get_settings,
 	is_enabled,
 	is_local_url,
@@ -166,47 +164,6 @@ def download_file(key=None, file_name=None, download=None):
 			inline=not frappe.utils.cint(download),
 		)
 	)
-
-
-@frappe.whitelist(methods=["GET"])
-def legacy_s3_file(key=None, file_name=None):
-	"""
-	Keeps links written by the Frappe S3 Attachment app working.
-
-	Registered as an override for frappe_s3_attachment.controller.generate_file, so old
-	links embedded in emails, notes and print formats resolve to the migrated R2 copy,
-	or (before migration) to the original S3 object.
-	"""
-	if not key:
-		raise frappe.DoesNotExistError(_("File not found"))
-
-	log = frappe.db.get_value(
-		"R2 Migration Log",
-		{"source": "Amazon S3", "source_key": key, "status": "Migrated"},
-		["file", "new_url"],
-		as_dict=True,
-		order_by="creation desc",
-	)
-	if log:
-		r2_key = key_from_url(log.new_url)
-		rows = frappe.get_all(
-			"File", filters={"file_url": log.new_url}, fields=["name", "is_private", "file_name"]
-		)
-		row = next(
-			(r for r in rows if not r.is_private or frappe.has_permission("File", "read", doc=r.name)), None
-		)
-		if not row:
-			raise frappe.PermissionError(_("You are not permitted to access this file"))
-		return _redirect(R2().presigned_url(r2_key, file_name or row.file_name, is_private=row.is_private))
-
-	settings = get_settings()
-	if settings.s3_bucket_name:
-		return _redirect(S3Source(settings).presigned_url(key, file_name))
-
-	if "frappe_s3_attachment" in frappe.get_installed_apps():
-		return frappe.get_attr(LEGACY_S3_METHOD)(key=key, file_name=file_name)
-
-	raise frappe.DoesNotExistError(_("File not found"))
 
 
 def _redirect(url):

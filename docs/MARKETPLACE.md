@@ -36,7 +36,7 @@ Every file your team uploads is stored in your own R2 bucket instead of the serv
 - Large files: S3 multipart upload, no 300 MB limit
 - 30-day recycle bin for deleted files (configurable)
 - **One-click migration** from the server disk to R2
-- **One-click migration from Frappe S3 Attachment / Amazon S3**: settings imported automatically, S3 copies kept 30 days, old S3 links keep working
+- **One-click migration from Frappe S3 Attachment / Amazon S3**: settings imported automatically, S3 copies kept 30 days, links inside Frappe updated automatically
 - Updates every Attach / Attach Image field, Single settings (logos) and, optionally, links inside notes, emails and web pages
 - Email attachments, Data Import and Prepared Reports work with files in R2
 - One-click exit back to local storage

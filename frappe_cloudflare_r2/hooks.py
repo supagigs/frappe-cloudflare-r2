@@ -37,11 +37,6 @@ try:
 except (ImportError, ValueError):
 	pass
 
-# Old links written by the Frappe S3 Attachment app keep working after migration.
-override_whitelisted_methods = {
-	"frappe_s3_attachment.controller.generate_file": "frappe_cloudflare_r2.controller.legacy_s3_file",
-}
-
 scheduler_events = {
 	"daily": ["frappe_cloudflare_r2.tasks.daily"],
 }

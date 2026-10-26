@@ -324,7 +324,7 @@ class TestCloudflareR2(FrappeTestCase):
 		self.assertFalse(os.path.exists(frappe.get_site_path("public", "files", pub_name)))
 		self.assertEqual(R2().get_bytes(key_from_url(new_private)), b"doc")
 
-	def test_s3_to_r2_migration_and_legacy_links(self):
+	def test_s3_to_r2_migration_rewrites_links(self):
 		configure(enabled=0)
 		c = raw_client()
 		c.put_object(
@@ -346,20 +346,27 @@ class TestCloudflareR2(FrappeTestCase):
 		).insert()
 		commit()
 
+		note = frappe.get_doc(
+			{
+				"doctype": "Note",
+				"title": frappe.generate_hash(length=6),
+				"content": f'<a href="{private_url}">contract</a>',
+			}
+		).insert()
+		commit()
+
 		self.assertEqual(legacy_s3_key(private_url), "2024/01/01/File/ABCD1234_old.txt")
 		self.assertEqual(legacy_s3_key(public_url), "2024/01/01/File/PUB_old.png")
 
-		configure(enabled=1)
+		configure(enabled=1, rewrite_text_links=0)
 		state = self._run("s3_to_r2")
 		self.assertEqual(state["failed"], 0)
 		new_private = frappe.db.get_value("File", fp.name, "file_url")
 		self.assertEqual(R2().get_bytes(key_from_url(new_private)), b"from s3")
 		self.assertTrue(key_from_url(frappe.db.get_value("File", fpub.name, "file_url")))
 
-		# old private S3 link now resolves to R2
-		frappe.local.response = frappe._dict()
-		controller.legacy_s3_file(key="2024/01/01/File/ABCD1234_old.txt")
-		self.assertEqual(requests.get(frappe.local.response["location"]).content, b"from s3")
+		# old S3 links inside rich text are rewritten to the R2 copy
+		self.assertIn(f'href="{new_private}"', frappe.db.get_value("Note", note.name, "content"))
 
 		# S3 original kept during retention, deleted after it
 		migration.purge_s3_sources()
