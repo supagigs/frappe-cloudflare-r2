@@ -1,0 +1,35 @@
+[project]
+name = "frappe_cloudflare_r2"
+authors = [{ name = "Supagigs", email = "support@supagigs.com" }]
+description = "Store Frappe / ERPNext attachments in Cloudflare R2, with one-click migration from local disk and Amazon S3."
+requires-python = ">=3.10"
+readme = "README.md"
+license = { file = "LICENSE" }
+dynamic = ["version"]
+dependencies = [
+    # Frappe already ships boto3; this only guards very old benches.
+    "boto3>=1.28",
+]
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[project.urls]
+Homepage = "https://github.com/supagigs/frappe-cloudflare-r2"
+Documentation = "https://github.com/supagigs/frappe-cloudflare-r2#readme"
+Issues = "https://github.com/supagigs/frappe-cloudflare-r2/issues"
+
+[tool.bench.frappe-dependencies]
+frappe = ">=15.0.0,<17.0.0"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B"]
+ignore = ["E501", "W191", "E101", "B017"]
+
+[tool.ruff.format]
+indent-style = "tab"

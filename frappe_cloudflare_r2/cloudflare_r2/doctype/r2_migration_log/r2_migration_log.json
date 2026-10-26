@@ -1,0 +1,175 @@
+{
+ "actions": [],
+ "autoname": "hash",
+ "creation": "2026-10-26 18:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "file",
+  "file_name",
+  "status",
+  "direction",
+  "source",
+  "is_private",
+  "column_break_1",
+  "run_id",
+  "batch_no",
+  "migrated_on",
+  "urls_section",
+  "old_url",
+  "new_url",
+  "r2_key",
+  "source_bucket",
+  "source_key",
+  "source_deleted",
+  "source_deleted_on",
+  "error"
+ ],
+ "fields": [
+  {
+   "fieldname": "file",
+   "fieldtype": "Link",
+   "label": "File",
+   "options": "File",
+   "in_list_view": 1,
+   "search_index": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "file_name",
+   "fieldtype": "Data",
+   "label": "File Name",
+   "in_list_view": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "Migrated\nSkipped\nFailed",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "direction",
+   "fieldtype": "Data",
+   "label": "Direction",
+   "in_standard_filter": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "source",
+   "fieldtype": "Select",
+   "label": "Source",
+   "options": "Local\nAmazon S3\nCloudflare R2",
+   "read_only": 1
+  },
+  {
+   "fieldname": "is_private",
+   "fieldtype": "Check",
+   "label": "Is Private",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break",
+   "read_only": 1
+  },
+  {
+   "fieldname": "run_id",
+   "fieldtype": "Data",
+   "label": "Run",
+   "in_standard_filter": 1,
+   "search_index": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "batch_no",
+   "fieldtype": "Int",
+   "label": "Batch",
+   "read_only": 1
+  },
+  {
+   "fieldname": "migrated_on",
+   "fieldtype": "Datetime",
+   "label": "Migrated On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "urls_section",
+   "fieldtype": "Section Break",
+   "label": "Locations",
+   "read_only": 1
+  },
+  {
+   "fieldname": "old_url",
+   "fieldtype": "Small Text",
+   "label": "Old URL",
+   "read_only": 1
+  },
+  {
+   "fieldname": "new_url",
+   "fieldtype": "Small Text",
+   "label": "New URL",
+   "read_only": 1
+  },
+  {
+   "fieldname": "r2_key",
+   "fieldtype": "Small Text",
+   "label": "R2 Key",
+   "read_only": 1
+  },
+  {
+   "fieldname": "source_bucket",
+   "fieldtype": "Data",
+   "label": "Source Bucket",
+   "read_only": 1
+  },
+  {
+   "fieldname": "source_key",
+   "fieldtype": "Data",
+   "label": "Source Key",
+   "length": 1000,
+   "read_only": 1
+  },
+  {
+   "fieldname": "source_deleted",
+   "fieldtype": "Check",
+   "label": "Source Deleted",
+   "read_only": 1
+  },
+  {
+   "fieldname": "source_deleted_on",
+   "fieldtype": "Datetime",
+   "label": "Source Deleted On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "error",
+   "fieldtype": "Small Text",
+   "label": "Error",
+   "read_only": 1
+  }
+ ],
+ "in_create": 1,
+ "links": [],
+ "modified": "2026-10-26 18:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Cloudflare R2",
+ "name": "R2 Migration Log",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "delete": 1,
+   "export": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager"
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "file_name"
+}

@@ -1,0 +1,8 @@
+.DS_Store
+*.pyc
+*.egg-info
+__pycache__
+node_modules
+dist/
+.venv/
+dump.rdb

@@ -1,0 +1,312 @@
+# Copyright (c) 2026, Supagigs and contributors
+# For license information, please see license.txt
+"""File hooks and HTTP endpoints."""
+
+import os
+import secrets
+
+import frappe
+from frappe import _
+
+from frappe_cloudflare_r2.storage import (
+	DEFAULT_IGNORED_DOCTYPES,
+	LEGACY_S3_METHOD,
+	R2,
+	S3Source,
+	get_settings,
+	is_enabled,
+	is_local_url,
+	key_from_url,
+	private_url_for,
+)
+
+
+def ignored_doctypes(settings=None):
+	settings = settings or get_settings()
+	configured = [d.strip() for d in (settings.ignored_doctypes or "").splitlines() if d.strip()]
+	from_conf = frappe.conf.get("ignore_r2_upload_for_doctype") or []
+	return set(configured or DEFAULT_IGNORED_DOCTYPES) | set(from_conf)
+
+
+def local_path(file_url):
+	"""Absolute path on disk for a /files/ or /private/files/ URL."""
+	if file_url.startswith("/private/files/"):
+		return frappe.get_site_path("private", "files", file_url[len("/private/files/") :])
+	return frappe.get_site_path("public", "files", file_url[len("/files/") :])
+
+
+# ---------------------------------------------------------------------------
+# doc_events
+# ---------------------------------------------------------------------------
+
+
+def upload_to_r2(doc, method=None):
+	"""File.after_insert: move the freshly written local file to R2."""
+	if doc.is_folder or doc.flags.ignore_r2 or not is_local_url(doc.file_url) or not is_enabled():
+		return
+
+	settings = get_settings()
+	if (doc.attached_to_doctype or "File") in ignored_doctypes(settings):
+		return
+
+	path = local_path(doc.file_url)
+	if not os.path.isfile(path):
+		return
+
+	old_url = doc.file_url
+	r2 = R2(settings)
+	key = r2.make_key(doc.file_name, doc.is_private, doc.attached_to_doctype, doc.attached_to_name)
+	try:
+		r2.upload_file(path, key, doc.is_private, doc.file_name)
+	except Exception:
+		frappe.log_error(title="Cloudflare R2: upload failed")
+		frappe.throw(_("Could not upload the file to Cloudflare R2. Please try again."))
+
+	new_url = r2.url_for(key, doc.is_private)
+
+	# Point every File row sharing this blob (Frappe de-duplicates by content hash) at R2.
+	frappe.db.sql(
+		"update `tabFile` set file_url=%s where file_url=%s and is_folder=0",
+		(new_url, old_url),
+	)
+	doc.file_url = new_url
+	repoint_attached_field(doc, old_url, new_url)
+
+	# If this request is rolled back the File row disappears, so the object must go too.
+	frappe.db.after_rollback.add(
+		lambda: _safe(r2.client.delete_object, Bucket=r2.bucket_for(doc.is_private), Key=key)
+	)
+	if settings.delete_local_after_upload:
+		frappe.db.after_commit.add(lambda: _safe(os.remove, path))
+
+
+def repoint_attached_field(doc, old_url, new_url):
+	"""Update the Attach / Attach Image field on the parent document, if it points at old_url."""
+	if not (doc.attached_to_doctype and doc.attached_to_name):
+		return
+	try:
+		meta = frappe.get_meta(doc.attached_to_doctype)
+	except frappe.DoesNotExistError:
+		return
+	fields = {f for f in (doc.attached_to_field, meta.image_field) if f and meta.has_field(f)}
+	if meta.issingle:
+		for f in fields:
+			if frappe.db.get_single_value(doc.attached_to_doctype, f) == old_url:
+				frappe.db.set_single_value(doc.attached_to_doctype, f, new_url)
+		return
+	for f in fields:
+		frappe.db.sql(
+			f"update `tab{doc.attached_to_doctype}` set `{f}`=%s where name=%s and `{f}`=%s",
+			(new_url, doc.attached_to_name, old_url),
+		)
+
+
+def delete_from_r2(doc, method=None):
+	"""File.on_trash: delete (or move to trash) the object once the deletion commits."""
+	if doc.is_folder or not doc.file_url:
+		return
+	settings = get_settings()
+	if not settings.delete_from_r2_on_trash:
+		return
+	key = key_from_url(doc.file_url, settings)
+	if not key:
+		return
+	if frappe.db.exists("File", {"file_url": doc.file_url, "name": ("!=", doc.name)}):
+		return  # another File record still uses this object
+
+	is_private = doc.is_private
+
+	def _delete():
+		try:
+			R2(settings).delete(key, is_private)
+		except Exception:
+			frappe.log_error(title=f"Cloudflare R2: could not delete {key}")
+
+	frappe.db.after_commit.add(_delete)
+
+
+def _safe(fn, *args, **kwargs):
+	try:
+		fn(*args, **kwargs)
+	except Exception:
+		pass
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET"])
+def download_file(key=None, file_name=None, download=None):
+	"""Serve an R2 object through a short-lived signed URL after checking File permissions."""
+	if not key:
+		raise frappe.DoesNotExistError(_("File not found"))
+
+	rows = frappe.get_all(
+		"File",
+		filters={"file_url": private_url_for(key)},
+		fields=["name", "is_private", "file_name"],
+		ignore_permissions=True,
+	)
+	if not rows:
+		raise frappe.DoesNotExistError(_("File not found"))
+
+	allowed = next((r for r in rows if not r.is_private), None)
+	if not allowed and frappe.session.user != "Guest":
+		allowed = next((r for r in rows if frappe.has_permission("File", "read", doc=r.name)), None)
+	if not allowed:
+		raise frappe.PermissionError(_("You are not permitted to access this file"))
+
+	_redirect(
+		R2().presigned_url(
+			key,
+			file_name=file_name or allowed.file_name,
+			is_private=allowed.is_private,
+			inline=not frappe.utils.cint(download),
+		)
+	)
+
+
+@frappe.whitelist(methods=["GET"])
+def legacy_s3_file(key=None, file_name=None, **kwargs):
+	"""
+	Keeps links written by the Frappe S3 Attachment app working.
+
+	Registered as an override for frappe_s3_attachment.controller.generate_file, so old
+	links embedded in emails, notes and print formats resolve to the migrated R2 copy,
+	or (before migration) to the original S3 object.
+	"""
+	if not key:
+		raise frappe.DoesNotExistError(_("File not found"))
+
+	log = frappe.db.get_value(
+		"R2 Migration Log",
+		{"source": "Amazon S3", "source_key": key, "status": "Migrated"},
+		["file", "new_url"],
+		as_dict=True,
+		order_by="creation desc",
+	)
+	if log:
+		r2_key = key_from_url(log.new_url)
+		rows = frappe.get_all(
+			"File", filters={"file_url": log.new_url}, fields=["name", "is_private", "file_name"]
+		)
+		row = next(
+			(r for r in rows if not r.is_private or frappe.has_permission("File", "read", doc=r.name)), None
+		)
+		if not row:
+			raise frappe.PermissionError(_("You are not permitted to access this file"))
+		return _redirect(R2().presigned_url(r2_key, file_name or row.file_name, is_private=row.is_private))
+
+	settings = get_settings()
+	if settings.s3_bucket_name:
+		return _redirect(S3Source(settings).presigned_url(key, file_name))
+
+	if "frappe_s3_attachment" in frappe.get_installed_apps():
+		return frappe.get_attr(LEGACY_S3_METHOD)(key=key, file_name=file_name)
+
+	raise frappe.DoesNotExistError(_("File not found"))
+
+
+def _redirect(url):
+	frappe.local.response["type"] = "redirect"
+	frappe.local.response["location"] = url
+
+
+# ---------------------------------------------------------------------------
+# Settings helpers
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist()
+def test_connection():
+	"""Write, read, sign and delete a probe object; check the public domain if set."""
+	frappe.only_for("System Manager")
+	import requests
+
+	settings = frappe.get_doc("Cloudflare R2 Settings")
+	r2 = R2(settings)
+	results, ok = [], True
+	token = secrets.token_hex(8)
+	probe = f"frappe-cloudflare-r2 connection test {token}".encode()
+	private_key = "/".join(p for p in (r2.folder, "private", "_connection_test", f"{token}.txt") if p)
+	public_key = "/".join(p for p in (r2.folder, "public", "_connection_test", f"{token}.txt") if p)
+
+	def step(label, fn):
+		nonlocal ok
+		try:
+			fn()
+			results.append(f"✅ {label}")
+			return True
+		except Exception as e:
+			ok = False
+			results.append(f"❌ {label}: {frappe.utils.cstr(e)[:300]}")
+			return False
+
+	def check_signed():
+		resp = requests.get(r2.presigned_url(private_key), timeout=20)
+		if resp.status_code != 200 or resp.content != probe:
+			raise Exception(f"HTTP {resp.status_code}")
+
+	if step(
+		f"Upload to private bucket '{r2.bucket}'",
+		lambda: r2.client.put_object(Bucket=r2.bucket, Key=private_key, Body=probe, ContentType="text/plain"),
+	):
+		step("Read back with the API token", lambda: r2.get_bytes(private_key, True))
+		step("Download through a signed URL", check_signed)
+
+	if r2.public_base_url:
+
+		def check_public():
+			r2.client.put_object(
+				Bucket=r2.public_bucket, Key=public_key, Body=probe, ContentType="text/plain"
+			)
+			resp = requests.get(r2.url_for(public_key, False), timeout=20)
+			if resp.status_code != 200 or resp.content != probe:
+				raise Exception(
+					f"HTTP {resp.status_code} from {r2.public_base_url}. Is the custom domain connected to bucket '{r2.public_bucket}'?"
+				)
+
+		step(f"Public file reachable via {r2.public_base_url}", check_public)
+
+		if r2.public_bucket == r2.bucket:
+			try:
+				leaked = requests.get(r2.url_for(private_key, False), timeout=20).status_code == 200
+			except Exception:
+				leaked = False
+			if leaked:
+				results.append(
+					"⚠️ Private files are also reachable through the public domain (same bucket). "
+					"Use a separate Public Bucket, or add a Cloudflare WAF rule that only allows paths "
+					"under /public/ on this domain. Private keys are random, but should not rely on secrecy."
+				)
+
+	for b, k in ((r2.bucket, private_key), (r2.public_bucket, public_key)):
+		_safe(r2.client.delete_object, Bucket=b, Key=k)
+
+	status = "\n".join(results)
+	frappe.db.set_single_value("Cloudflare R2 Settings", "connection_status", status)
+	return {"ok": ok, "status": status}
+
+
+@frappe.whitelist()
+def load_s3_attachment_settings(overwrite=1):
+	"""Copy bucket, region and keys from the Frappe S3 Attachment app's settings."""
+	frappe.only_for("System Manager")
+	if not frappe.db.table_exists("S3 File Attachment"):
+		frappe.throw(_("The Frappe S3 Attachment app is not installed on this site."))
+
+	src = frappe.get_single("S3 File Attachment")
+	mapping = {
+		"s3_bucket_name": src.get("bucket_name"),
+		"s3_region": src.get("region_name"),
+		"s3_access_key_id": src.get("aws_key"),
+		"s3_secret_access_key": src.get("aws_secret"),
+	}
+	settings = frappe.get_single("Cloudflare R2 Settings")
+	for field, value in mapping.items():
+		if value and (frappe.utils.cint(overwrite) or not settings.get(field)):
+			settings.set(field, value)
+	settings.save()
+	return {k: (v if "secret" not in k else bool(v)) for k, v in mapping.items()}

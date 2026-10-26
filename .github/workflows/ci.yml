@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main, version-15, version-16]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - frappe: version-15
+            python: "3.11"
+            node: 18
+          - frappe: version-16
+            python: "3.14"
+            node: 24
+    name: Frappe ${{ matrix.frappe }}
+    services:
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports: ["3306:3306"]
+        options: --health-cmd="healthcheck.sh --connect --innodb_initialized" --health-interval=5s --health-timeout=2s --health-retries=20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: app
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install bench
+        run: |
+          sudo apt-get update && sudo apt-get install -y mariadb-client
+          pip install frappe-bench
+      - name: Init bench
+        run: |
+          bench init --skip-redis-config-generation --skip-assets --frappe-branch ${{ matrix.frappe }} --python "$(which python)" ~/bench
+          cd ~/bench
+          bench set-config -g redis_cache redis://127.0.0.1:6379
+          bench set-config -g redis_queue redis://127.0.0.1:6379
+          bench set-config -g redis_socketio redis://127.0.0.1:6379
+          bench get-app "$GITHUB_WORKSPACE/app"
+          ./env/bin/pip install "moto[server]"
+      - name: Create site
+        working-directory: /home/runner/bench
+        run: |
+          bench new-site --db-root-password root --db-host 127.0.0.1 --admin-password admin test.local
+          bench --site test.local install-app frappe_cloudflare_r2
+          bench --site test.local set-config allow_tests true
+      - name: Run tests
+        working-directory: /home/runner/bench
+        run: bench --site test.local run-tests --app frappe_cloudflare_r2
