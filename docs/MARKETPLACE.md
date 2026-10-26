@@ -11,6 +11,7 @@ Copy these values into **Frappe Cloud → Dashboard → Marketplace → New App*
 | Category | Integrations (secondary: Utilities) |
 | Pricing | Free |
 | Logo | `frappe_cloudflare_r2/public/images/logo.png` (512×512 PNG) |
+| Listing image | `docs/images/marketplace-banner.png` (600×600; original artwork, no Cloudflare logo) |
 | Website | https://supagigs.com |
 | Support | support@supagigs.com |
 | Documentation | https://github.com/supagigs/frappe-cloudflare-r2#readme |
@@ -48,6 +49,8 @@ Every file your team uploads is stored in your own R2 bucket instead of the serv
 3. Tick **Enable**, then click **Migrate Local Files → R2** if you have existing files.
 
 Made by Supagigs · MIT licensed · support@supagigs.com
+
+_Cloudflare and Cloudflare R2 are trademarks of Cloudflare, Inc. This app is an independent integration by Supagigs and is not affiliated with, sponsored by or endorsed by Cloudflare, Inc. Frappe and ERPNext are trademarks of Frappe Technologies Pvt. Ltd._
 ```
 
 ## Screenshots to add (1280×800)

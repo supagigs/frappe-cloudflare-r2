@@ -193,3 +193,7 @@ The tests run against a local S3-compatible server (moto), covering uploads, mul
 MIT © 2026 Supagigs. Inspired by [Frappe S3 Attachment](https://github.com/zerodha/frappe-attachments-s3) by Zerodha (MIT).
 
 Support: **support@supagigs.com** · Issues: [GitHub](https://github.com/supagigs/frappe-cloudflare-r2/issues)
+
+### Trademarks
+
+Cloudflare and Cloudflare R2 are trademarks of Cloudflare, Inc. This app is an independent integration by Supagigs and is not affiliated with, sponsored by or endorsed by Cloudflare, Inc. Frappe and ERPNext are trademarks of Frappe Technologies Pvt. Ltd.
