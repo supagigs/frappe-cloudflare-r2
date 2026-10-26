@@ -23,9 +23,19 @@ doc_events = {
 	}
 }
 
-override_doctype_class = {
-	"File": "frappe_cloudflare_r2.overrides.file.R2File",
+# Read file bytes from R2 (email attachments, Data Import, ...).
+# v16+: extend the core File class. v15 has no extension hook, so it needs a class override.
+extend_doctype_class = {
+	"File": ["frappe_cloudflare_r2.overrides.file.R2FileMixin"],
 }
+
+try:
+	from frappe import __version__ as _frappe_version
+
+	if int(_frappe_version.split(".")[0]) < 16:
+		override_doctype_class = {"File": "frappe_cloudflare_r2.overrides.file.R2File"}
+except (ImportError, ValueError):
+	pass
 
 # Old links written by the Frappe S3 Attachment app keep working after migration.
 override_whitelisted_methods = {

@@ -17,7 +17,9 @@ import re
 
 import frappe
 from frappe import _
+from frappe.query_builder.functions import IfNull, Max, Min
 from frappe.utils import add_days, cint, now_datetime
+from pypika.terms import Case, Field, Function
 
 from frappe_cloudflare_r2.controller import ignored_doctypes, local_path
 from frappe_cloudflare_r2.storage import (
@@ -41,6 +43,7 @@ DIRECTIONS = {
 	"s3_to_r2": "Amazon S3 → R2",
 	"r2_to_local": "R2 → Local disk",
 }
+ATTACH_FIELDTYPES = ("Attach", "Attach Image")
 TEXT_FIELDTYPES = ("Text Editor", "HTML Editor", "Markdown Editor", "Long Text", "Text")
 SKIP_TEXT_DOCTYPES = {
 	"Version",
@@ -115,23 +118,28 @@ def run_batch(state, after, batch_no):
 			result = _migrate_one(direction, row, settings, r2, s3, state["run_id"], batch_no)
 			state[result] += 1
 			state["done"] += 1
-			frappe.db.commit()
+			# Long-running background job: commit after every file so progress survives a
+			# worker restart and the local copy is only removed once the new URL is saved.
+			frappe.db.commit()  # nosemgrep
 			if result == "migrated" and direction == "local_to_r2" and settings.delete_local_after_upload:
 				_remove(local_path(row.file_url))
 
 		_rewrite_references(state["run_id"], batch_no, rewrite_text=cint(settings.rewrite_text_links))
-		frappe.db.commit()
+		# end of batch: persist the re-pointed references before the next job is queued
+		frappe.db.commit()  # nosemgrep
 	except Exception:
 		frappe.db.rollback()
 		frappe.cache.delete_value(LOCK_KEY)
 		frappe.log_error(title=f"Cloudflare R2 migration {state['run_id']} stopped")
 		_set_status(state, "Stopped with an error (see Error Log). Run it again to resume")
-		frappe.db.commit()
+		# the job is ending after a rollback; persist the status and error log for the user
+		frappe.db.commit()  # nosemgrep
 		return
 
 	if len(candidates) == BATCH_SIZE:
 		_set_status(state, "Running")
-		frappe.db.commit()
+		# persist progress before handing over to the next batch job
+		frappe.db.commit()  # nosemgrep
 		frappe.enqueue(
 			"frappe_cloudflare_r2.migration.run_batch",
 			queue="long",
@@ -143,7 +151,8 @@ def run_batch(state, after, batch_no):
 	else:
 		frappe.cache.delete_value(LOCK_KEY)
 		_set_status(state, "Completed")
-		frappe.db.commit()
+		# final status of a background job that has already committed its batches
+		frappe.db.commit()  # nosemgrep
 
 
 def _set_status(state, label):
@@ -166,32 +175,33 @@ def _set_status(state, label):
 
 def _candidates(direction, settings, after, limit):
 	"""Distinct file URLs to migrate, ordered by URL so batches can resume with a cursor."""
+	File = frappe.qb.DocType("File")
 	if direction == "local_to_r2":
-		where = "(file_url like '/files/%%' or file_url like '/private/files/%%')"
+		condition = File.file_url.like("/files/%") | File.file_url.like("/private/files/%")
 	elif direction == "s3_to_r2":
-		where = f"(file_url like '/api/method/{LEGACY_S3_METHOD}%%' or file_url like 'http%%')"
+		condition = File.file_url.like(f"/api/method/{LEGACY_S3_METHOD}%") | File.file_url.like("http%")
 	else:
+		condition = File.file_url.like(DOWNLOAD_PREFIX + "%")
 		base = (settings.public_base_url or "").rstrip("/")
-		where = "(file_url like %(dl)s" + (" or file_url like %(base)s)" if base else ")")
+		if base:
+			condition = condition | File.file_url.like(base + "/%")
 
-	params = {
-		"after": after or "",
-		"dl": DOWNLOAD_PREFIX + "%",
-		"base": (settings.public_base_url or "").rstrip("/") + "/%",
-	}
-	rows = frappe.db.sql(
-		f"""
-		select file_url, max(is_private) as is_private, min(file_name) as file_name,
-			min(attached_to_doctype) as attached_to_doctype, min(name) as file
-		from `tabFile`
-		where is_folder=0 and {where} and file_url > %(after)s
-		group by file_url
-		order by file_url
-		{f"limit {int(limit)}" if limit else ""}
-		""",
-		params,
-		as_dict=True,
+	query = (
+		frappe.qb.from_(File)
+		.select(
+			File.file_url,
+			Max(File.is_private).as_("is_private"),
+			Min(File.file_name).as_("file_name"),
+			Min(File.attached_to_doctype).as_("attached_to_doctype"),
+			Min(File.name).as_("file"),
+		)
+		.where((File.is_folder == 0) & condition & (File.file_url > (after or "")))
+		.groupby(File.file_url)
+		.orderby(File.file_url)
 	)
+	if limit:
+		query = query.limit(limit)
+	rows = query.run(as_dict=True)
 	ignored = ignored_doctypes(settings) if direction == "local_to_r2" else set()
 	for r in rows:
 		if direction == "s3_to_r2":
@@ -333,79 +343,62 @@ def _try(fn, *args):
 
 
 def _rewrite_references(run_id, batch_no, rewrite_text=False):
-	"""Replace old URLs with new ones everywhere they are stored, one statement per field."""
+	"""Replace old URLs with new ones everywhere they are stored, one UPDATE per field per batch."""
 	filters = {"run_id": run_id, "batch_no": batch_no, "status": "Migrated"}
-	if not frappe.db.exists(LOG, filters):
+	mappings = frappe.get_all(LOG, filters=filters, fields=["old_url", "new_url"])
+	if not mappings:
 		return
-	if frappe.db.db_type == "postgres":
-		_rewrite_references_row_by_row(filters)
-	else:
-		for doctype, field in _attach_fields():
-			try:
-				frappe.db.sql(
-					f"""update `tab{doctype}` t join `tab{LOG}` l on t.`{field}`=l.old_url
-					set t.`{field}`=l.new_url
-					where l.run_id=%(run)s and l.batch_no=%(b)s and l.status='Migrated'""",
-					{"run": run_id, "b": batch_no},
-				)
-			except Exception:
-				frappe.log_error(title=f"Cloudflare R2: could not update {doctype}.{field}")
+	olds = [m.old_url for m in mappings]
 
-		# Single DocTypes (e.g. Website Settings logo) live in tabSingles
-		frappe.db.sql(
-			f"""update `tabSingles` s join `tab{LOG}` l on s.value=l.old_url
-			set s.value=l.new_url
-			where l.run_id=%(run)s and l.batch_no=%(b)s and l.status='Migrated'
-			and s.doctype!='Cloudflare R2 Settings'""",
-			{"run": run_id, "b": batch_no},
-		)
+	def mapped(column):
+		case = Case()
+		for m in mappings:
+			case = case.when(column == m.old_url, m.new_url)
+		return case.else_(column)
+
+	for doctype, fieldname in _fields_of_type(ATTACH_FIELDTYPES):
+		table = frappe.qb.DocType(doctype)
+		column = Field(fieldname, table=table)
+		try:
+			frappe.qb.update(table).set(column, mapped(column)).where(column.isin(olds)).run()
+		except Exception:
+			frappe.log_error(title=f"Cloudflare R2: could not update {doctype}.{fieldname}")
+
+	# Single DocTypes (e.g. Website Settings logo) live in tabSingles
+	singles = frappe.qb.DocType("Singles")
+	(
+		frappe.qb.update(singles)
+		.set(singles.value, mapped(singles.value))
+		.where(singles.value.isin(olds) & (singles.doctype != "Cloudflare R2 Settings"))
+	).run()
 
 	if rewrite_text:
-		mappings = frappe.get_all(LOG, filters=filters, fields=["old_url", "new_url"])
 		_rewrite_text_links(mappings)
 
 
-def _rewrite_references_row_by_row(filters):
-	mappings = frappe.get_all(LOG, filters=filters, fields=["old_url", "new_url"])
-	fields = _attach_fields()
-	for m in mappings:
-		for doctype, field in fields:
-			frappe.db.sql(
-				f'update "tab{doctype}" set "{field}"=%s where "{field}"=%s', (m.new_url, m.old_url)
-			)
-		frappe.db.sql(
-			"""update "tabSingles" set value=%s where value=%s and doctype!='Cloudflare R2 Settings'""",
-			(m.new_url, m.old_url),
-		)
-
-
-def _attach_fields():
-	rows = frappe.db.sql(
-		"""
-		select df.parent, df.fieldname from `tabDocField` df
-		join `tabDocType` dt on dt.name=df.parent
-		where df.fieldtype in ('Attach', 'Attach Image') and dt.issingle=0 and ifnull(dt.is_virtual,0)=0
-		union
-		select cf.dt, cf.fieldname from `tabCustom Field` cf
-		join `tabDocType` dt on dt.name=cf.dt
-		where cf.fieldtype in ('Attach', 'Attach Image') and dt.issingle=0 and ifnull(dt.is_virtual,0)=0
-		"""
+def _fields_of_type(fieldtypes):
+	"""(doctype, fieldname) for standard and custom fields of these types on regular DocTypes."""
+	DocType = frappe.qb.DocType("DocType")
+	regular = set(
+		frappe.qb.from_(DocType)
+		.select(DocType.name)
+		.where((DocType.issingle == 0) & (IfNull(DocType.is_virtual, 0) == 0))
+		.run(pluck=True)
 	)
-	return [(dt, f) for dt, f in rows if frappe.db.table_exists(dt)]
-
-
-def _text_fields():
-	ft = ", ".join(f"'{t}'" for t in TEXT_FIELDTYPES)
-	rows = frappe.db.sql(
-		f"""
-		select df.parent, df.fieldname from `tabDocField` df join `tabDocType` dt on dt.name=df.parent
-		where df.fieldtype in ({ft}) and dt.issingle=0 and ifnull(dt.is_virtual,0)=0
-		union
-		select cf.dt, cf.fieldname from `tabCustom Field` cf join `tabDocType` dt on dt.name=cf.dt
-		where cf.fieldtype in ({ft}) and dt.issingle=0 and ifnull(dt.is_virtual,0)=0
-		"""
+	DocField = frappe.qb.DocType("DocField")
+	CustomField = frappe.qb.DocType("Custom Field")
+	rows = (
+		frappe.qb.from_(DocField)
+		.select(DocField.parent, DocField.fieldname)
+		.where(DocField.fieldtype.isin(fieldtypes))
+		.run()
+	) + (
+		frappe.qb.from_(CustomField)
+		.select(CustomField.dt, CustomField.fieldname)
+		.where(CustomField.fieldtype.isin(fieldtypes))
+		.run()
 	)
-	return [(dt, f) for dt, f in rows if dt not in SKIP_TEXT_DOCTYPES and frappe.db.table_exists(dt)]
+	return sorted({(dt, f) for dt, f in rows if dt in regular and frappe.db.table_exists(dt)})
 
 
 def _rewrite_text_links(mappings):
@@ -414,27 +407,31 @@ def _rewrite_text_links(mappings):
 	replaced ("url, 'url, (url) so '/files/a.png' never matches inside '/private/files/a.png'.
 	"""
 	site = frappe.utils.get_url().rstrip("/")
-	fields = _text_fields()
+	fields = [f for f in _fields_of_type(TEXT_FIELDTYPES) if f[0] not in SKIP_TEXT_DOCTYPES]
 	for m in mappings:
 		olds = [m.old_url]
 		if is_local_url(m.old_url):
 			olds.insert(0, site + m.old_url)
-		for doctype, field in fields:
-			expr = f"`{field}`"
-			params = {"like": "%" + _like_escape(m.old_url) + "%"}
-			i = 0
+		for doctype, fieldname in fields:
+			table = frappe.qb.DocType(doctype)
+			column = Field(fieldname, table=table)
+			expr = column
 			for old in olds:
-				for q in ('"', "'", "("):
-					params[f"o{i}"], params[f"n{i}"] = q + old, q + m.new_url
-					expr = f"replace({expr}, %(o{i})s, %(n{i})s)"
-					i += 1
+				for quote_char in ('"', "'", "("):
+					expr = Replace(expr, quote_char + old, quote_char + m.new_url)
 			try:
-				frappe.db.sql(
-					f"update `tab{doctype}` set `{field}`={expr} where `{field}` like %(like)s",
-					params,
-				)
+				(
+					frappe.qb.update(table)
+					.set(column, expr)
+					.where(column.like("%" + _like_escape(m.old_url) + "%"))
+				).run()
 			except Exception:
-				frappe.log_error(title=f"Cloudflare R2: could not rewrite links in {doctype}.{field}")
+				frappe.log_error(title=f"Cloudflare R2: could not rewrite links in {doctype}.{fieldname}")
+
+
+class Replace(Function):
+	def __init__(self, term, old, new):
+		super().__init__("REPLACE", term, old, new)
 
 
 def _like_escape(value):
@@ -492,4 +489,3 @@ def purge_s3_sources():
 			frappe.db.set_value(LOG, log.name, {"source_deleted": 1, "source_deleted_on": now_datetime()})
 		except Exception:
 			frappe.log_error(title=f"Cloudflare R2: could not delete S3 object {log.source_key}")
-	frappe.db.commit()

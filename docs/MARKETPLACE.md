@@ -48,7 +48,7 @@ Every file your team uploads is stored in your own R2 bucket instead of the serv
 2. Open **Cloudflare R2 Settings**, paste Account ID, bucket and keys, click **Test Connection**.
 3. Tick **Enable**, then click **Migrate Local Files → R2** if you have existing files.
 
-Made by Supagigs · MIT licensed · support@supagigs.com
+Made by Supagigs · MIT licensed
 
 _Cloudflare and Cloudflare R2 are trademarks of Cloudflare, Inc. This app is an independent integration by Supagigs and is not affiliated with, sponsored by or endorsed by Cloudflare, Inc. Frappe and ERPNext are trademarks of Frappe Technologies Pvt. Ltd._
 ```

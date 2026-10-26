@@ -95,10 +95,10 @@ def repoint_attached_field(doc, old_url, new_url):
 				frappe.db.set_single_value(doc.attached_to_doctype, f, new_url)
 		return
 	for f in fields:
-		frappe.db.sql(
-			f"update `tab{doc.attached_to_doctype}` set `{f}`=%s where name=%s and `{f}`=%s",
-			(new_url, doc.attached_to_name, old_url),
-		)
+		if frappe.db.get_value(doc.attached_to_doctype, doc.attached_to_name, f) == old_url:
+			frappe.db.set_value(
+				doc.attached_to_doctype, doc.attached_to_name, f, new_url, update_modified=False
+			)
 
 
 def delete_from_r2(doc, method=None):
@@ -169,7 +169,7 @@ def download_file(key=None, file_name=None, download=None):
 
 
 @frappe.whitelist(methods=["GET"])
-def legacy_s3_file(key=None, file_name=None, **kwargs):
+def legacy_s3_file(key=None, file_name=None):
 	"""
 	Keeps links written by the Frappe S3 Attachment app working.
 
