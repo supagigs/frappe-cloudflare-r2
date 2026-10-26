@@ -15,8 +15,8 @@ Copy these values into **Frappe Cloud → Dashboard → Marketplace → New App*
 | Website | https://supagigs.com |
 | Support | support@supagigs.com |
 | Documentation | https://github.com/supagigs/frappe-cloudflare-r2#readme |
-| Privacy policy | https://supagigs.com/privacy *(publish this page before submitting)* |
-| Terms of service | https://supagigs.com/terms *(publish this page before submitting)* |
+| Privacy policy | https://github.com/supagigs/frappe-cloudflare-r2/blob/main/PRIVACY.md |
+| Terms of service | https://github.com/supagigs/frappe-cloudflare-r2/blob/main/TERMS.md |
 
 ## Short description (≤ 140 characters)
 
