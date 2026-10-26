@@ -98,7 +98,9 @@ def make_file(name, content=None, is_private=1, **kw):
 
 
 def commit():
-	frappe.db.commit()  # runs after_commit hooks (local delete, R2 delete)
+	frappe.db.commit()
+	# v16's test runner does not fire after_commit callbacks on commit(); run them explicitly
+	frappe.db.after_commit.run()
 
 
 class TestCloudflareR2(FrappeTestCase):
@@ -132,8 +134,9 @@ class TestCloudflareR2(FrappeTestCase):
 	# -- uploads ---------------------------------------------------------------
 
 	def test_private_upload_goes_to_r2_and_local_copy_removed(self):
-		doc = make_file("r2-private.txt", b"secret bytes")
-		local = frappe.get_site_path("private", "files", "r2-private.txt")
+		name = f"r2-private-{frappe.generate_hash(length=6)}.txt"
+		doc = make_file(name, b"secret bytes")
+		local = frappe.get_site_path("private", "files", name)
 		commit()
 
 		self.assertTrue(doc.file_url.startswith(DOWNLOAD_PREFIX))
@@ -212,7 +215,7 @@ class TestCloudflareR2(FrappeTestCase):
 	# -- deletion & retention ----------------------------------------------------
 
 	def test_delete_moves_to_trash_then_purge(self):
-		doc = make_file("to-delete.txt", b"bye")
+		doc = make_file("to-delete.txt")
 		commit()
 		key = key_from_url(doc.file_url)
 		doc.delete()
@@ -228,7 +231,7 @@ class TestCloudflareR2(FrappeTestCase):
 
 	def test_delete_immediately_when_retention_zero(self):
 		configure(trash_retention_days=0)
-		doc = make_file("hard-delete.txt", b"x")
+		doc = make_file("hard-delete.txt")
 		commit()
 		key = key_from_url(doc.file_url)
 		doc.delete()
@@ -280,7 +283,8 @@ class TestCloudflareR2(FrappeTestCase):
 
 	def test_local_to_r2_migration_repoints_references(self):
 		configure(enabled=0)
-		f1 = make_file("mig-public.png", b"img", is_private=0)
+		pub_name = f"mig-public-{frappe.generate_hash(length=6)}.png"
+		f1 = make_file(pub_name, b"img", is_private=0)
 		f2 = make_file("mig-private.txt", b"doc")
 		old_public, old_private = f1.file_url, f2.file_url
 		commit()
@@ -317,7 +321,7 @@ class TestCloudflareR2(FrappeTestCase):
 		self.assertIn(f'src="{new_public}"', content)
 		self.assertIn(f'href="{new_private}"', content)
 		self.assertIn(f"/private{old_public}", content)  # unquoted lookalike untouched
-		self.assertFalse(os.path.exists(frappe.get_site_path("public", "files", "mig-public.png")))
+		self.assertFalse(os.path.exists(frappe.get_site_path("public", "files", pub_name)))
 		self.assertEqual(R2().get_bytes(key_from_url(new_private)), b"doc")
 
 	def test_s3_to_r2_migration_and_legacy_links(self):

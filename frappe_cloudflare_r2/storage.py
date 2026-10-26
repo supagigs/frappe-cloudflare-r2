@@ -57,7 +57,7 @@ def r2_endpoint(account_id, jurisdiction=None):
 
 
 def get_settings():
-	return frappe.get_cached_doc(SETTINGS_DOCTYPE)
+	return frappe.get_cached_doc(SETTINGS_DOCTYPE, SETTINGS_DOCTYPE)
 
 
 def is_enabled():
