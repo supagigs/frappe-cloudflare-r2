@@ -6,7 +6,7 @@ Copy these values into **Frappe Cloud → Dashboard → Marketplace → New App*
 |---|---|
 | Repository | `https://github.com/supagigs/frappe-cloudflare-r2` |
 | Branch(es) | `version-15` and `version-16` (both point to the same code; keep `main` in sync) |
-| App name (slug) | `frappe-cloudflare-r2` |
+| App name | `frappe_cloudflare_r2` (repo: frappe-cloudflare-r2) |
 | Title | Cloudflare R2 |
 | Category | Integrations (secondary: Utilities) |
 | Pricing | Free |

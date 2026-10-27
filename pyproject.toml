@@ -1,5 +1,5 @@
 [project]
-name = "frappe-cloudflare-r2"
+name = "frappe_cloudflare_r2"
 authors = [{ name = "Supagigs", email = "support@supagigs.com" }]
 description = "Store Frappe / ERPNext attachments in Cloudflare R2, with one-click migration from local disk and Amazon S3."
 requires-python = ">=3.10"
