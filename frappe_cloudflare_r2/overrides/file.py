@@ -24,6 +24,23 @@ class R2FileMixin:
 
 		return key_from_url(self.file_url)
 
+	def get_raw_content(self) -> bytes:
+		"""Exact bytes of the file wherever it is stored (R2 or local disk), never decoded.
+
+		Use this instead of get_content() or open(get_full_path()) for binary files
+		such as PDFs and images.
+		"""
+		key = self._r2_key()
+		if key:
+			from frappe_cloudflare_r2.storage import R2
+
+			return R2().get_bytes(key, self.is_private)
+		if self.get("content"):
+			content = self.content
+			return content.encode() if isinstance(content, str) else content
+		with open(self.get_full_path(), "rb") as fh:
+			return fh.read()
+
 	def get_content(self, *args, **kwargs):
 		key = None if self.get("content") else self._r2_key()
 		if not key:
@@ -32,8 +49,11 @@ class R2FileMixin:
 		from frappe_cloudflare_r2.storage import R2
 
 		content = R2().get_bytes(key, self.is_private)
+		encodings = kwargs.get("encodings")
+		if encodings is None:
+			encodings = ENCODINGS
 		if not content.startswith(OLE_SIGNATURE):
-			for encoding in kwargs.get("encodings") or ENCODINGS:
+			for encoding in encodings:
 				try:
 					content = content.decode(encoding)
 					break

@@ -148,6 +148,15 @@ class TestCloudflareR2(FrappeTestCase):
 		# content still readable through the File API (email attachments etc.)
 		self.assertEqual(frappe.get_doc("File", doc.name).get_content(), "secret bytes")
 
+	def test_raw_content_returns_exact_bytes(self):
+		pdf = b"\x00\xff%PDF-like binary \xe2\xe3\xcf\xd3" + os.urandom(64)
+		doc = make_file("contract.bin", pdf)
+		commit()
+		self.assertTrue(key_from_url(doc.file_url))
+		fresh = frappe.get_doc("File", doc.name)
+		self.assertEqual(fresh.get_raw_content(), pdf)
+		self.assertIsInstance(fresh.get_raw_content(), bytes)
+
 	def test_public_upload_uses_public_domain_and_bucket(self):
 		configure(public_base_url="https://files.example.com", public_bucket_name=PUBLIC_BUCKET)
 		doc = make_file("logo.png", is_private=0)
