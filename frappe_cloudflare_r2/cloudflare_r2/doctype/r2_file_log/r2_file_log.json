@@ -1,0 +1,174 @@
+{
+ "actions": [],
+ "autoname": "hash",
+ "creation": "2026-10-28 18:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "event",
+  "status",
+  "file_name",
+  "file",
+  "is_private",
+  "user",
+  "column_break_1",
+  "attached_to_doctype",
+  "attached_to_name",
+  "size",
+  "location_section",
+  "from_location",
+  "to_location",
+  "bucket",
+  "r2_key",
+  "file_url",
+  "details_section",
+  "note",
+  "error"
+ ],
+ "fields": [
+  {
+   "fieldname": "event",
+   "fieldtype": "Select",
+   "read_only": 1,
+   "label": "Event",
+   "options": "Uploaded\nSkipped\nUpload Failed\nRolled Back\nMoved to Trash\nDeleted\nDelete Failed\nKept\nPurged",
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "read_only": 1,
+   "label": "Status",
+   "options": "Success\nSkipped\nFailed",
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "file_name",
+   "fieldtype": "Data",
+   "read_only": 1,
+   "label": "File Name",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "file",
+   "fieldtype": "Data",
+   "read_only": 1,
+   "label": "File",
+   "search_index": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "is_private",
+   "fieldtype": "Check",
+   "read_only": 1,
+   "label": "Is Private"
+  },
+  {
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "read_only": 1,
+   "label": "User",
+   "options": "User",
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "attached_to_doctype",
+   "fieldtype": "Link",
+   "read_only": 1,
+   "label": "Attached To DocType",
+   "options": "DocType",
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "attached_to_name",
+   "fieldtype": "Data",
+   "read_only": 1,
+   "label": "Attached To Name"
+  },
+  {
+   "fieldname": "size",
+   "fieldtype": "Int",
+   "read_only": 1,
+   "label": "Size (bytes)"
+  },
+  {
+   "fieldname": "location_section",
+   "fieldtype": "Section Break",
+   "label": "Location"
+  },
+  {
+   "fieldname": "from_location",
+   "fieldtype": "Small Text",
+   "read_only": 1,
+   "label": "From"
+  },
+  {
+   "fieldname": "to_location",
+   "fieldtype": "Small Text",
+   "read_only": 1,
+   "label": "To"
+  },
+  {
+   "fieldname": "bucket",
+   "fieldtype": "Data",
+   "read_only": 1,
+   "label": "Bucket"
+  },
+  {
+   "fieldname": "r2_key",
+   "fieldtype": "Small Text",
+   "read_only": 1,
+   "label": "R2 Key"
+  },
+  {
+   "fieldname": "file_url",
+   "fieldtype": "Small Text",
+   "read_only": 1,
+   "label": "File URL"
+  },
+  {
+   "fieldname": "details_section",
+   "fieldtype": "Section Break",
+   "label": "Details"
+  },
+  {
+   "fieldname": "note",
+   "fieldtype": "Small Text",
+   "read_only": 1,
+   "label": "Note"
+  },
+  {
+   "fieldname": "error",
+   "fieldtype": "Small Text",
+   "read_only": 1,
+   "label": "Error"
+  }
+ ],
+ "in_create": 1,
+ "links": [],
+ "modified": "2026-10-28 18:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Cloudflare R2",
+ "name": "R2 File Log",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "delete": 1,
+   "export": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager"
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "file_name",
+ "show_title_field_in_link": 0
+}

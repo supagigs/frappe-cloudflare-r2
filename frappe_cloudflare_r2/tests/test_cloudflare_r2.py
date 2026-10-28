@@ -179,8 +179,10 @@ class TestCloudflareR2(FrappeTestCase):
 
 	def test_disabled_does_nothing(self):
 		configure(enabled=0)
-		doc = make_file("disabled.txt")
+		name = f"disabled-{frappe.generate_hash(length=6)}.txt"
+		doc = make_file(name)
 		self.assertTrue(doc.file_url.startswith("/private/files/"))
+		self.assertIn("disabled", self._log(name, "Skipped")[0].error)
 
 	def test_multipart_upload(self):
 		configure(multipart_threshold_mb=5, multipart_chunksize_mb=5)
@@ -273,6 +275,68 @@ class TestCloudflareR2(FrappeTestCase):
 		copy.delete()
 		commit()
 		self.assertFalse(R2().exists(key))
+
+	# -- file log --------------------------------------------------------------------
+
+	def _log(self, file_name, event):
+		return frappe.get_all(
+			"R2 File Log",
+			filters={"file_name": file_name, "event": event},
+			fields=["status", "from_location", "to_location", "bucket", "r2_key", "size", "error", "note"],
+			order_by="creation desc",
+			limit=1,
+		)
+
+	def test_file_log_upload_skip_trash_delete(self):
+		name = f"log-{frappe.generate_hash(length=6)}.txt"
+		doc = make_file(name, b"logged")
+		commit()
+		up = self._log(name, "Uploaded")[0]
+		self.assertEqual(up.status, "Success")
+		self.assertTrue(up.from_location.startswith("/private/files/"))
+		self.assertEqual(up.to_location, f"r2://{R2_BUCKET}/{key_from_url(doc.file_url)}")
+		self.assertEqual(up.size, 6)
+
+		doc.delete()
+		commit()
+		trash = self._log(name, "Moved to Trash")[0]
+		self.assertIn("/_trash/", trash.to_location)
+
+		configure(trash_retention_days=0)
+		name2 = f"log-{frappe.generate_hash(length=6)}.txt"
+		doc2 = make_file(name2)
+		commit()
+		doc2.delete()
+		commit()
+		self.assertEqual(self._log(name2, "Deleted")[0].status, "Success")
+
+		configure(ignored_doctypes="ToDo")
+		todo = frappe.get_doc({"doctype": "ToDo", "description": "x"}).insert()
+		name3 = f"log-{frappe.generate_hash(length=6)}.txt"
+		make_file(name3, attached_to_doctype="ToDo", attached_to_name=todo.name)
+		commit()
+		self.assertIn("Keep Local", self._log(name3, "Skipped")[0].error)
+
+	def test_file_log_records_failed_upload_after_rollback(self):
+		configure(bucket_name="bucket-that-does-not-exist")
+		name = f"fail-{frappe.generate_hash(length=6)}.txt"
+		with self.assertRaises(frappe.ValidationError):
+			make_file(name)
+		frappe.db.rollback()
+		configure()
+		failed = self._log(name, "Upload Failed")
+		self.assertTrue(failed)
+		self.assertEqual(failed[0].status, "Failed")
+		self.assertIn("NoSuchBucket", failed[0].error)
+
+	def test_file_log_purge(self):
+		doc = make_file(f"purge-{frappe.generate_hash(length=6)}.txt")
+		commit()
+		key = key_from_url(doc.file_url)
+		doc.delete()
+		commit()
+		migration.purge_r2_trash(older_than_days=-1)  # everything in trash counts as expired
+		self.assertTrue(frappe.db.exists("R2 File Log", {"event": "Purged", "r2_key": ("like", f"%{key}")}))
 
 	# -- migrations ----------------------------------------------------------------
 

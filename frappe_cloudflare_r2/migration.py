@@ -445,14 +445,27 @@ def _like_escape(value):
 # ---------------------------------------------------------------------------
 
 
-def purge_r2_trash():
+def purge_r2_trash(older_than_days=None):
 	"""Daily: permanently remove R2 objects deleted more than N days ago."""
 	settings = get_settings()
-	days = cint(settings.trash_retention_days)
-	if not (settings.access_key_id and settings.bucket_name) or days <= 0:
+	days = cint(settings.trash_retention_days) if older_than_days is None else older_than_days
+	if not (settings.access_key_id and settings.bucket_name) or (older_than_days is None and days <= 0):
 		return
 	try:
-		count = R2(settings).purge_trash(days)
+		from frappe_cloudflare_r2.file_log import log, r2_location
+
+		def _logged(bucket, objects):
+			for obj in objects:
+				log(
+					"Purged",
+					"Success",
+					from_location=r2_location(bucket, obj["Key"]),
+					bucket=bucket,
+					r2_key=obj["Key"],
+					note=f"Trash older than {days} days permanently deleted",
+				)
+
+		count = R2(settings).purge_trash(days, on_purged=_logged)
 		if count:
 			frappe.logger("frappe_cloudflare_r2").info(
 				f"Purged {count} trashed objects older than {days} days"

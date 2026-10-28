@@ -128,8 +128,26 @@ Files attached to DocTypes listed in **Keep Local for DocTypes** (default `Data 
 | Keep Deleted Files For (days) | 30 | Deleted objects are copied to `<folder>/_trash/<timestamp>/<key>` and purged daily after N days. `0` = delete immediately. |
 | Keep S3 Originals For (days) | 30 | After S3 → R2 migration. `0` = keep forever. |
 | Delete Server Copy After Upload | ✔ | Local copy removed after the upload commits. |
+| Keep File Log For (days) | 180 | Retention of the R2 File Log. `0` = keep forever. |
 
 To restore a deleted file within the window, copy it back from the `_trash/` prefix in the Cloudflare dashboard (or with any S3 tool) to its original key.
+
+## File Log
+
+**Cloudflare R2 Settings → Logs → File Log** (DocType *R2 File Log*) records every file movement, with user, size, the attached document and the exact locations (`/private/files/…` → `r2://bucket/key`):
+
+| Event | Meaning |
+|---|---|
+| Uploaded | Moved from the server disk to R2 |
+| Skipped | Not uploaded: R2 disabled, DocType kept local, or file missing on disk (reason in *Error*) |
+| Upload Failed | R2 rejected the upload; the user saw an error and nothing was saved |
+| Rolled Back | Upload worked but the request failed later, so the R2 object was removed again |
+| Moved to Trash / Deleted | File deleted in Frappe (trash location shown) |
+| Kept | Deleted in Frappe but the object is still used by another File, or deletion from R2 is off |
+| Delete Failed | R2 deletion failed (see *Error*) |
+| Purged | Trash older than the retention period permanently deleted |
+
+Rows older than **Keep File Log For (days)** (default 180) are removed daily. Bulk migrations are recorded in the separate *R2 Migration Log*.
 
 ## Settings reference
 
@@ -175,6 +193,16 @@ Delete  ─► File.on_trash ─► after commit: copy to _trash/, delete origin
 - Links inside rich text are only rewritten when the option is ticked, and only where they are quoted (`"url"`, `'url'`, `(url)`).
 - While Frappe S3 Attachment is still installed, its own upload hook also runs. Migrate, then uninstall it.
 - Another app that also overrides the `File` DocType class may conflict with this one.
+
+## For app developers: reading file bytes
+
+Once files live in R2, `open(file_doc.get_full_path())` no longer works, because the path is now a URL. Use:
+
+```python
+content = file_doc.get_raw_content()   # exact bytes, from R2 or local disk
+```
+
+`get_content()` also works, but like Frappe's own version it may decode text-looking files to `str`.
 
 ## Development
 

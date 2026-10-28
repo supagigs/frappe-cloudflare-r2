@@ -8,6 +8,7 @@ import secrets
 import frappe
 from frappe import _
 
+from frappe_cloudflare_r2.file_log import log, r2_location
 from frappe_cloudflare_r2.storage import (
 	DEFAULT_IGNORED_DOCTYPES,
 	R2,
@@ -40,24 +41,61 @@ def local_path(file_url):
 
 def upload_to_r2(doc, method=None):
 	"""File.after_insert: move the freshly written local file to R2."""
-	if doc.is_folder or doc.flags.ignore_r2 or not is_local_url(doc.file_url) or not is_enabled():
+	if doc.is_folder or doc.flags.ignore_r2 or not is_local_url(doc.file_url):
+		return
+	if not is_enabled():
+		# configured but switched off: record it, so "why is this file not in R2?" has an answer
+		if frappe.db.get_single_value("Cloudflare R2 Settings", "bucket_name"):
+			log(
+				"Skipped",
+				"Skipped",
+				doc,
+				from_location=doc.file_url,
+				error="Cloudflare R2 is disabled in Cloudflare R2 Settings",
+			)
 		return
 
 	settings = get_settings()
 	if (doc.attached_to_doctype or "File") in ignored_doctypes(settings):
+		log(
+			"Skipped",
+			"Skipped",
+			doc,
+			from_location=doc.file_url,
+			error=f"{doc.attached_to_doctype or 'File'} is in 'Keep Local for DocTypes'",
+		)
 		return
 
 	path = local_path(doc.file_url)
 	if not os.path.isfile(path):
+		log("Skipped", "Skipped", doc, from_location=doc.file_url, error="File not found on server disk")
 		return
 
 	old_url = doc.file_url
+	size = os.path.getsize(path)
 	r2 = R2(settings)
+	bucket = r2.bucket_for(doc.is_private)
 	key = r2.make_key(doc.file_name, doc.is_private, doc.attached_to_doctype, doc.attached_to_name)
 	try:
 		r2.upload_file(path, key, doc.is_private, doc.file_name)
-	except Exception:
+	except Exception as e:
+		reason = f"{type(e).__name__}: {e}"
 		frappe.log_error(title="Cloudflare R2: upload failed")
+		# the request is about to roll back, so record the failure once it has
+		frappe.db.after_rollback.add(
+			lambda: log(
+				"Upload Failed",
+				"Failed",
+				doc,
+				commit=True,
+				from_location=old_url,
+				to_location=r2_location(bucket, key),
+				bucket=bucket,
+				r2_key=key,
+				size=size,
+				error=reason,
+			)
+		)
 		frappe.throw(_("Could not upload the file to Cloudflare R2. Please try again."))
 
 	new_url = r2.url_for(key, doc.is_private)
@@ -69,11 +107,34 @@ def upload_to_r2(doc, method=None):
 	)
 	doc.file_url = new_url
 	repoint_attached_field(doc, old_url, new_url)
-
-	# If this request is rolled back the File row disappears, so the object must go too.
-	frappe.db.after_rollback.add(
-		lambda: _safe(r2.client.delete_object, Bucket=r2.bucket_for(doc.is_private), Key=key)
+	log(
+		"Uploaded",
+		"Success",
+		doc,
+		from_location=old_url,
+		to_location=r2_location(bucket, key),
+		bucket=bucket,
+		r2_key=key,
+		size=size,
+		note="Server copy removed after commit" if settings.delete_local_after_upload else "Server copy kept",
 	)
+
+	def _rolled_back():
+		# The File row (and the log above) disappear with the rollback, so remove the object too.
+		_safe(r2.client.delete_object, Bucket=bucket, Key=key)
+		log(
+			"Rolled Back",
+			"Failed",
+			doc,
+			commit=True,
+			from_location=r2_location(bucket, key),
+			bucket=bucket,
+			r2_key=key,
+			size=size,
+			note="Upload succeeded but the request failed later; R2 object removed",
+		)
+
+	frappe.db.after_rollback.add(_rolled_back)
 	if settings.delete_local_after_upload:
 		frappe.db.after_commit.add(lambda: _safe(os.remove, path))
 
@@ -104,21 +165,68 @@ def delete_from_r2(doc, method=None):
 	if doc.is_folder or not doc.file_url:
 		return
 	settings = get_settings()
-	if not settings.delete_from_r2_on_trash:
-		return
 	key = key_from_url(doc.file_url, settings)
 	if not key:
 		return
+	r2 = R2(settings)
+	bucket = r2.bucket_for(doc.is_private)
+	where = r2_location(bucket, key)
+	if not settings.delete_from_r2_on_trash:
+		log(
+			"Kept",
+			"Skipped",
+			doc,
+			from_location=where,
+			bucket=bucket,
+			r2_key=key,
+			note="'Delete From R2 When File Is Deleted' is off",
+		)
+		return
 	if frappe.db.exists("File", {"file_url": doc.file_url, "name": ("!=", doc.name)}):
-		return  # another File record still uses this object
+		log(
+			"Kept",
+			"Skipped",
+			doc,
+			from_location=where,
+			bucket=bucket,
+			r2_key=key,
+			note="Another File record still uses this object",
+		)
+		return
 
 	is_private = doc.is_private
+	days = settings.trash_retention_days or 0
+	trash_key = r2.trash_key(key) if days > 0 else None
+	# Logged inside the transaction: if the deletion is rolled back, so is this row.
+	if trash_key:
+		log(
+			"Moved to Trash",
+			"Success",
+			doc,
+			from_location=where,
+			to_location=r2_location(bucket, trash_key),
+			bucket=bucket,
+			r2_key=key,
+			note=f"Permanently deleted after {days} days",
+		)
+	else:
+		log("Deleted", "Success", doc, from_location=where, bucket=bucket, r2_key=key)
 
 	def _delete():
 		try:
-			R2(settings).delete(key, is_private)
-		except Exception:
+			r2.delete(key, is_private, trash_key=trash_key)
+		except Exception as e:
 			frappe.log_error(title=f"Cloudflare R2: could not delete {key}")
+			log(
+				"Delete Failed",
+				"Failed",
+				doc,
+				commit=True,
+				from_location=where,
+				bucket=bucket,
+				r2_key=key,
+				error=f"{type(e).__name__}: {e}",
+			)
 
 	frappe.db.after_commit.add(_delete)
 

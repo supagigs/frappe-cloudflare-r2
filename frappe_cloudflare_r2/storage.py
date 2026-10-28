@@ -253,7 +253,7 @@ class R2:
 				return False
 			raise
 
-	def delete(self, key, is_private=True):
+	def delete(self, key, is_private=True, trash_key=None):
 		"""Delete an object, honouring the retention policy (soft delete into trash)."""
 		bucket = self.bucket_for(is_private)
 		days = self.settings.trash_retention_days or 0
@@ -261,7 +261,7 @@ class R2:
 			self.client.copy(
 				{"Bucket": bucket, "Key": key},
 				bucket,
-				self.trash_key(key),
+				trash_key or self.trash_key(key),
 				Config=self.transfer_config(),
 			)
 		self.client.delete_object(Bucket=bucket, Key=key)
@@ -274,10 +274,11 @@ class R2:
 		stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
 		return f"{self.trash_prefix()}{stamp}/{key}"
 
-	def purge_trash(self, older_than_days):
+	def purge_trash(self, older_than_days, on_purged=None):
 		"""Permanently delete trashed objects older than N days. Returns count deleted."""
 		cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=older_than_days)
 		deleted = 0
+		on_purged = on_purged or (lambda bucket, objects: None)
 		for bucket in {self.bucket, self.public_bucket}:
 			batch = []
 			for obj in self._iter_objects(bucket, self.trash_prefix()):
@@ -285,9 +286,11 @@ class R2:
 					batch.append({"Key": obj["Key"]})
 				if len(batch) == 1000:
 					deleted += self._delete_many(bucket, batch)
+					on_purged(bucket, batch)
 					batch = []
 			if batch:
 				deleted += self._delete_many(bucket, batch)
+				on_purged(bucket, batch)
 		return deleted
 
 	def _delete_many(self, bucket, objects):

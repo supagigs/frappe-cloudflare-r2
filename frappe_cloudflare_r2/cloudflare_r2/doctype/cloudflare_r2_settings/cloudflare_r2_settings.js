@@ -28,7 +28,8 @@ frappe.ui.form.on("Cloudflare R2 Settings", {
 	},
 
 	refresh(frm) {
-		frm.add_custom_button(__("Migration Log"), () => frappe.set_route("List", "R2 Migration Log"));
+		frm.add_custom_button(__("File Log"), () => frappe.set_route("List", "R2 File Log"), __("Logs"));
+		frm.add_custom_button(__("Migration Log"), () => frappe.set_route("List", "R2 Migration Log"), __("Logs"));
 		if (frm.doc.__onload && frm.doc.__onload.s3_app_installed) {
 			frm.dashboard.set_headline_alert(
 				__("Frappe S3 Attachment is installed. Migrate its files to R2, then uninstall it."),
