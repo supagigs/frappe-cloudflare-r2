@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, version-15, version-16]
+    branches: [main, version-16]
   pull_request:
 
 concurrency:
@@ -16,9 +16,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - frappe: version-15
-            python: "3.11"
-            node: 18
           - frappe: version-16
             python: "3.14"
             node: 24

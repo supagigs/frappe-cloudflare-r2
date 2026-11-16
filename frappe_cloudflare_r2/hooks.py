@@ -39,6 +39,9 @@ except (ImportError, ValueError):
 
 scheduler_events = {
 	"daily": ["frappe_cloudflare_r2.tasks.daily"],
+	"cron": {
+		"*/15 * * * *": ["frappe_cloudflare_r2.tasks.every_fifteen_minutes"],
+	},
 }
 
 # Other apps can customise object keys by declaring:

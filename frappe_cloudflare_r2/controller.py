@@ -8,6 +8,7 @@ import secrets
 import frappe
 from frappe import _
 
+from frappe_cloudflare_r2.file_log import DOCTYPE as FILE_LOG_DOCTYPE
 from frappe_cloudflare_r2.file_log import log, r2_location
 from frappe_cloudflare_r2.storage import (
 	DEFAULT_IGNORED_DOCTYPES,
@@ -80,6 +81,22 @@ def upload_to_r2(doc, method=None):
 		r2.upload_file(path, key, doc.is_private, doc.file_name)
 	except Exception as e:
 		reason = f"{type(e).__name__}: {e}"
+		if settings.keep_file_on_upload_failure:
+			# Keep the email and its file on this server. The scheduled retry uploads it later.
+			frappe.log_error(title="Cloudflare R2: upload deferred")
+			log(
+				"Upload Deferred",
+				"Deferred",
+				doc,
+				from_location=old_url,
+				to_location=r2_location(bucket, key),
+				bucket=bucket,
+				r2_key=key,
+				size=size,
+				note="File kept on server disk; retried every 15 minutes",
+				error=reason,
+			)
+			return
 		frappe.log_error(title="Cloudflare R2: upload failed")
 		# the request is about to roll back, so record the failure once it has
 		frappe.db.after_rollback.add(
@@ -98,6 +115,12 @@ def upload_to_r2(doc, method=None):
 		)
 		frappe.throw(_("Could not upload the file to Cloudflare R2. Please try again."))
 
+	finish_upload(doc, settings, r2, path, key, size, old_url)
+
+
+def finish_upload(doc, settings, r2, path, key, size, old_url, note=None):
+	"""Point the File records at the new object and log it. Shared by the request and the retry."""
+	bucket = r2.bucket_for(doc.is_private)
 	new_url = r2.url_for(key, doc.is_private)
 
 	# Point every File row sharing this blob (Frappe de-duplicates by content hash) at R2.
@@ -116,12 +139,30 @@ def upload_to_r2(doc, method=None):
 		bucket=bucket,
 		r2_key=key,
 		size=size,
-		note="Server copy removed after commit" if settings.delete_local_after_upload else "Server copy kept",
+		note=note
+		or ("Server copy removed after commit" if settings.delete_local_after_upload else "Server copy kept"),
 	)
 
 	def _rolled_back():
 		# The File row (and the log above) disappear with the rollback, so remove the object too.
-		_safe(r2.client.delete_object, Bucket=bucket, Key=key)
+		try:
+			r2.client.delete_object(Bucket=bucket, Key=key)
+		except Exception as e:
+			# A bucket lock can refuse the delete. Say so, rather than claim the object was removed.
+			frappe.log_error(title=f"Cloudflare R2: could not remove {key} after rollback")
+			log(
+				"Kept",
+				"Failed",
+				doc,
+				commit=True,
+				from_location=r2_location(bucket, key),
+				bucket=bucket,
+				r2_key=key,
+				size=size,
+				error=f"{type(e).__name__}: {e}",
+				note="Upload succeeded but the request failed later; R2 delete failed, so the object was kept",
+			)
+			return
 		log(
 			"Rolled Back",
 			"Failed",
@@ -137,6 +178,71 @@ def upload_to_r2(doc, method=None):
 	frappe.db.after_rollback.add(_rolled_back)
 	if settings.delete_local_after_upload:
 		frappe.db.after_commit.add(lambda: _safe(os.remove, path))
+
+
+def retry_deferred_uploads():
+	"""Every 15 minutes: retry uploads deferred during an R2 outage. Keeps retrying until they succeed."""
+	if not is_enabled():
+		return
+	settings = get_settings()
+	r2 = R2(settings)
+	deferred = frappe.get_all(
+		FILE_LOG_DOCTYPE,
+		filters={"event": "Upload Deferred", "status": "Deferred"},
+		fields=["name", "file", "from_location", "r2_key"],
+		order_by="creation asc",
+	)
+	for row in deferred:
+		# an earlier row for the same blob may already have uploaded it
+		if frappe.db.get_value(FILE_LOG_DOCTYPE, row.name, "status") != "Deferred":
+			continue
+		try:
+			_retry_one(row, settings, r2)
+			frappe.db.commit()  # nosemgrep
+		except Exception:
+			frappe.db.rollback()
+			frappe.logger("frappe_cloudflare_r2").exception(f"Deferred upload retry failed for {row.r2_key}")
+
+
+def _retry_one(row, settings, r2):
+	if not frappe.db.exists("File", row.file):
+		set_deferred_status(row.from_location, "Skipped", "File record was deleted")
+		return
+	doc = frappe.get_doc("File", row.file)
+	if doc.file_url != row.from_location:
+		# another File record with the same content already moved this blob to R2
+		set_deferred_status(row.from_location, "Success", "Uploaded with another record sharing this file")
+		return
+	path = local_path(row.from_location) if is_local_url(row.from_location) else None
+	if not path or not os.path.isfile(path):
+		set_deferred_status(row.from_location, "Skipped", "File is no longer on the server disk")
+		return
+	size = os.path.getsize(path)
+	try:
+		r2.upload_file(path, row.r2_key, doc.is_private, doc.file_name)
+	except Exception:
+		return  # R2 still down: stay deferred and try again on the next run
+	finish_upload(
+		doc,
+		settings,
+		r2,
+		path,
+		row.r2_key,
+		size,
+		row.from_location,
+		note="Uploaded on retry after an R2 outage",
+	)
+	set_deferred_status(row.from_location, "Success", "Uploaded on retry")
+
+
+def set_deferred_status(from_location, status, note):
+	"""Close every deferred row for this local file, so it no longer counts as waiting."""
+	for name in frappe.get_all(
+		FILE_LOG_DOCTYPE,
+		filters={"event": "Upload Deferred", "status": "Deferred", "from_location": from_location},
+		pluck="name",
+	):
+		frappe.db.set_value(FILE_LOG_DOCTYPE, name, {"status": status, "note": note}, update_modified=False)
 
 
 def repoint_attached_field(doc, old_url, new_url):

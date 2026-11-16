@@ -24,6 +24,7 @@
   "folder_name",
   "ignored_doctypes",
   "delete_local_after_upload",
+  "keep_file_on_upload_failure",
   "column_break_up",
   "multipart_threshold_mb",
   "multipart_chunksize_mb",
@@ -169,6 +170,13 @@
    "fieldtype": "Check",
    "label": "Delete Server Copy After Upload",
    "default": "1"
+  },
+  {
+   "fieldname": "keep_file_on_upload_failure",
+   "fieldtype": "Check",
+   "label": "Keep File on Server If Upload Fails",
+   "default": "0",
+   "description": "Keep the file on this server and retry the upload every 15 minutes, instead of rolling the record back"
   },
   {
    "fieldname": "column_break_up",
