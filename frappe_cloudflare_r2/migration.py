@@ -33,6 +33,7 @@ from frappe_cloudflare_r2.storage import (
 	is_local_url,
 	key_from_url,
 	legacy_s3_key,
+	side_for,
 	slug,
 )
 
@@ -307,11 +308,17 @@ def _s3_to_r2(row, r2, s3):
 	}
 
 
-def _r2_to_local(row, r2, settings):
+def _r2_to_local(row, r2, settings, after_commit=None):
+	"""Download the object to the server disk. Its R2 object and cached copies are removed after commit.
+
+	after_commit: where to queue that clean-up (default frappe.db.after_commit). A caller that may
+	still fail after this returns passes its own CallbackManager and queues it only on success.
+	"""
 	key = key_from_url(row.file_url, settings)
 	if not key:
 		raise _Skip("Not an R2 URL")
-	is_private = cint(row.is_private)
+	# the key's side, not the row's: a private object must never land in public/files
+	is_private = side_for(key, row.is_private)
 	folder = frappe.get_site_path("private" if is_private else "public", "files")
 	os.makedirs(folder, exist_ok=True)
 	name = slug(row.file_name, "file")
@@ -322,8 +329,13 @@ def _r2_to_local(row, r2, settings):
 		name = f"{base}-{n}{ext}"
 	path = os.path.join(folder, name)
 	r2.download_to(key, path, is_private)
-	frappe.db.after_commit.add(lambda: _try(r2.delete, key, is_private))
-	frappe.db.after_commit.add(lambda: cache.remove(key, is_private, row.file_name))
+	if is_private and not cint(row.is_private):
+		# a row made public after upload: the bytes are private, so the rows must be too
+		File = frappe.qb.DocType("File")
+		frappe.qb.update(File).set(File.is_private, 1).where(File.file_url == row.file_url).run()
+	cleanup = frappe.db.after_commit if after_commit is None else after_commit
+	cleanup.add(lambda: _try(r2.delete, key, is_private))
+	cleanup.add(lambda: cache.remove(key, is_private, row.file_name))
 	return ("/private/files/" if is_private else "/files/") + name, {"source": "Cloudflare R2", "r2_key": key}
 
 

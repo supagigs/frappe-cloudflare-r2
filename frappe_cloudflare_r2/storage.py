@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import frappe
 from frappe import _
+from frappe.utils import cint
 
 SETTINGS_DOCTYPE = "Cloudflare R2 Settings"
 DOWNLOAD_METHOD = "frappe_cloudflare_r2.controller.download_file"
@@ -112,6 +113,12 @@ def key_is_private(key):
 	if "public" in parts:
 		return 0
 	return None
+
+
+def side_for(key, row_is_private):
+	"""1 if the object is in the private bucket, else 0: from the key, or the File row if the key doesn't say."""
+	from_key = key_is_private(key)
+	return cint(row_is_private) if from_key is None else from_key
 
 
 def is_r2_url(file_url, settings=None):

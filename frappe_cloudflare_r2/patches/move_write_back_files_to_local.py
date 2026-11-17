@@ -11,11 +11,15 @@ is left in R2 and written to the Error Log; run this again once the cause is fix
     bench --site <site> execute frappe_cloudflare_r2.patches.move_write_back_files_to_local.execute
 """
 
+import contextlib
+import os
+
 import frappe
 from frappe.query_builder.functions import Max, Min
-from frappe.utils import now_datetime
+from frappe.utils import CallbackManager, now_datetime
 
 from frappe_cloudflare_r2 import migration
+from frappe_cloudflare_r2.controller import local_path
 from frappe_cloudflare_r2.storage import DOWNLOAD_PREFIX, R2, WRITE_BACK_DOCTYPES, get_settings
 
 ERROR_TITLE = "Cloudflare R2: write-back file NOT moved back to the server"
@@ -37,12 +41,14 @@ def execute():
 		return
 
 	run_id = f"write-back-to-local-{now_datetime().strftime('%Y%m%d%H%M%S')}"
-	moved = 0
-	for row in rows:
-		if _move(row, r2, settings, run_id):
-			moved += 1
+	moved = sum(_move(row, r2, settings, run_id) for row in rows)
 	if moved:
 		migration._rewrite_references(run_id, 1)
+	failed = len(rows) - moved
+	print(
+		f"Cloudflare R2 write-back files moved to the server: moved {moved}, failed {failed}"
+		+ ("; see Error Log" if failed else "")
+	)
 
 
 def _candidates(settings):
@@ -68,9 +74,19 @@ def _candidates(settings):
 
 
 def _move(row, r2, settings, run_id):
+	"""Move one file. On any failure nothing changes: DB writes undone, local file removed, object kept."""
+	savepoint = f"r2_write_back_{frappe.generate_hash(length=8)}"
+	frappe.db.savepoint(savepoint)
+	cleanup = CallbackManager()  # R2 delete + cache removal, queued only once the rows point here
+	new_url = None
 	try:
-		new_url, extra = migration._r2_to_local(row, r2, settings)
+		new_url, extra = migration._r2_to_local(row, r2, settings, after_commit=cleanup)
+		_repoint(row, new_url, extra, run_id)
 	except Exception:
+		frappe.db.rollback(save_point=savepoint)
+		if new_url:
+			with contextlib.suppress(OSError):
+				os.remove(local_path(new_url))
 		frappe.log_error(
 			title=ERROR_TITLE,
 			message=f"File {row.file} ({row.file_url}) attached to {row.attached_to_doctype} is still in R2. "
@@ -79,7 +95,11 @@ def _move(row, r2, settings, run_id):
 			reference_name=row.file,
 		)
 		return False
+	frappe.db.after_commit.add(cleanup.run)
+	return True
 
+
+def _repoint(row, new_url, extra, run_id):
 	File = frappe.qb.DocType("File")
 	frappe.qb.update(File).set(File.file_url, new_url).where(
 		(File.file_url == row.file_url) & (File.is_folder == 0)
@@ -100,4 +120,3 @@ def _move(row, r2, settings, run_id):
 			**extra,
 		}
 	).insert()  # patches and bench execute run as Administrator
-	return True

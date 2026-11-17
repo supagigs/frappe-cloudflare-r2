@@ -77,7 +77,9 @@ class TestR2CacheFixes(R2TestCase):
 		# a row changed before 1.0.1 (validate now refuses it), so bypass validate
 		frappe.db.set_value("File", doc.name, "is_private", 0, update_modified=False)
 		commit()
-		public_copy = frappe.get_doc("File", doc.name).get_full_path()
+		self.assertEqual(frappe.get_doc("File", doc.name).get_full_path(), private_copy)  # side from the key
+		# a public-side copy left by the row's flag before 1.0.1 read the bucket from the row
+		public_copy = cache.cached_copy(key, 0, doc.file_name)
 		self.assertNotEqual(private_copy, public_copy)
 		self.assertTrue(os.path.exists(private_copy) and os.path.exists(public_copy))
 
@@ -248,3 +250,117 @@ class TestR2CacheFixes(R2TestCase):
 		with mock.patch.object(set_cache_defaults.frappe, "clear_document_cache") as clear:
 			set_cache_defaults.execute()
 		clear.assert_called_once_with(set_cache_defaults.SETTINGS, set_cache_defaults.SETTINGS)
+
+
+class TestBucketFromKey(R2TestCase):
+	"""Rows whose is_private changed before 1.0.1: the key, not the row, names the bucket."""
+
+	def toggled_file(self, content):
+		configure(public_bucket_name=base.PUBLIC_BUCKET)  # a wrong-bucket read would 404
+		doc = make_file(f"toggled-{frappe.generate_hash(length=6)}.txt", content)
+		commit()
+		frappe.db.set_value("File", doc.name, "is_private", 0, update_modified=False)
+		commit()
+		doc = frappe.get_doc("File", doc.name)
+		self.assertEqual(key_is_private(key_from_url(doc.file_url)), 1)
+		self.assertEqual(doc.is_private, 0)
+		return doc
+
+	def test_toggled_row_reads_caches_and_deletes_in_the_keys_bucket(self):
+		import hashlib
+
+		content = frappe.generate_hash().encode()
+		doc = self.toggled_file(content)
+		key = key_from_url(doc.file_url)
+		self.assertEqual(doc.get_raw_content(), content)
+		self.assertEqual(doc.get_content(), content.decode())
+		path = doc.get_full_path()
+		private_name = hashlib.sha256(f"private:{key}".encode()).hexdigest()
+		self.assertTrue(os.path.basename(path).startswith(private_name))
+		with open(path, "rb") as fh:
+			self.assertEqual(fh.read(), content)
+
+		frappe.delete_doc("File", doc.name)
+		commit()
+		self.assertFalse(R2().exists(key, True))  # moved to trash in the private bucket
+		self.assertTrue(R2().exists(R2().trash_key(key), True))
+		self.assertFalse(os.path.exists(path))
+
+	def test_r2_to_local_puts_a_private_key_under_private_files(self):
+		from frappe.utils import CallbackManager
+
+		from frappe_cloudflare_r2.storage import get_settings
+
+		content = frappe.generate_hash().encode()
+		doc = self.toggled_file(content)
+		row = frappe._dict(file_url=doc.file_url, is_private=0, file_name=doc.file_name, file=doc.name)
+		cleanup = CallbackManager()  # not run: the File row still points at R2 in this test
+		new_url, _extra = migration._r2_to_local(row, R2(), get_settings(), after_commit=cleanup)
+		path = controller.local_path(new_url)
+		try:
+			self.assertTrue(new_url.startswith("/private/files/"), new_url)
+			private_files = os.path.abspath(frappe.get_site_path("private", "files"))
+			self.assertEqual(os.path.dirname(os.path.abspath(path)), private_files)
+			with open(path, "rb") as fh:
+				self.assertEqual(fh.read(), content)
+			self.assertEqual(frappe.db.get_value("File", doc.name, "is_private"), 1)
+		finally:
+			os.remove(path)
+
+	def test_key_without_a_side_falls_back_to_the_row_flag(self):
+		from frappe_cloudflare_r2.storage import DOWNLOAD_PREFIX, side_for
+
+		self.assertEqual(side_for("yardi/reports/2026/rent-roll.pdf", 1), 1)
+		self.assertEqual(side_for("yardi/reports/2026/rent-roll.pdf", 0), 0)
+		self.assertEqual(side_for("site/private/x.pdf", 0), 1)
+		self.assertEqual(side_for("site/public/x.pdf", 1), 0)
+		for is_private in (1, 0):
+			doc = frappe.get_doc(
+				{
+					"doctype": "File",
+					"file_url": DOWNLOAD_PREFIX + "yardi/reports/rent-roll.pdf",
+					"file_name": "rent-roll.pdf",
+					"is_private": is_private,
+				}
+			)
+			with mock.patch.object(R2, "get_bytes", return_value=b"%PDF") as get_bytes:
+				doc.get_raw_content()
+			self.assertEqual(get_bytes.call_args[0], ("yardi/reports/rent-roll.pdf", is_private))
+
+	def test_compat_checks_installed_apps_before_querying(self):
+		from frappe_cloudflare_r2 import compat
+
+		with (
+			mock.patch.object(compat.frappe, "get_installed_apps", return_value=["frappe"]),
+			mock.patch.object(compat.frappe.db, "sql") as sql,
+		):
+			self.assertIsNone(compat.r2_file("anything.pdf"))
+		sql.assert_not_called()
+
+	def test_write_back_patch_undoes_a_failure_after_download(self):
+		doc = make_file(f"statement-{frappe.generate_hash(length=6)}.csv", b"a,b\n")
+		commit()
+		frappe.db.set_value(
+			"File", doc.name, {"attached_to_doctype": "Bank Statement Import"}, update_modified=False
+		)
+		commit()
+		key = key_from_url(doc.file_url)
+		original = write_back_patch._candidates
+		with (
+			mock.patch.object(
+				write_back_patch, "_candidates", lambda s: [r for r in original(s) if r.file == doc.name]
+			),
+			mock.patch.object(write_back_patch, "_repoint", side_effect=RuntimeError("log insert failed")),
+			mock.patch.object(write_back_patch.frappe, "log_error") as log_error,
+			mock.patch("builtins.print") as printed,
+		):
+			write_back_patch.execute()
+		commit()
+		log_error.assert_called_once()
+		self.assertIn("moved 0, failed 1; see Error Log", printed.call_args[0][0])
+		self.assertEqual(frappe.db.get_value("File", doc.name, "file_url"), doc.file_url)
+		self.assertTrue(R2().exists(key, True))  # clean-up was never queued
+		private_files = frappe.get_site_path("private", "files")
+		self.assertFalse(
+			any(name.startswith(os.path.splitext(doc.file_name)[0]) for name in os.listdir(private_files))
+		)

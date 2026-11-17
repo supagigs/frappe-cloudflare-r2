@@ -21,6 +21,7 @@ from frappe_cloudflare_r2.storage import (
 	key_from_url,
 	key_is_private,
 	private_url_for,
+	side_for,
 )
 
 
@@ -280,12 +281,13 @@ def delete_from_r2(doc, method=None):
 	if not key:
 		return
 	r2 = R2(settings)
-	bucket = r2.bucket_for(doc.is_private)
+	is_private = side_for(key, doc.is_private)  # the key's bucket, even if the row was toggled
+	bucket = r2.bucket_for(is_private)
 	where = r2_location(bucket, key)
 	shared = frappe.db.exists("File", {"file_url": doc.file_url, "name": ("!=", doc.name)})
 	if not shared:
 		# the server's cached copy goes with the last File that uses it, whatever happens to the object
-		is_private, file_name = doc.is_private, doc.file_name
+		file_name = doc.file_name
 		frappe.db.after_commit.add(lambda: cache.remove(key, is_private, file_name))
 	if not settings.delete_from_r2_on_trash:
 		log(
@@ -310,7 +312,6 @@ def delete_from_r2(doc, method=None):
 		)
 		return
 
-	is_private = doc.is_private
 	days = settings.trash_retention_days or 0
 	trash_key = r2.trash_key(key) if days > 0 else None
 	# Logged inside the transaction: if the deletion is rolled back, so is this row.

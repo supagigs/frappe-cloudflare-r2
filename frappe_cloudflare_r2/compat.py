@@ -121,8 +121,11 @@ def r2_file(file_name):
 	"""
 	if not isinstance(file_name, str) or not file_name or "../" in file_name:
 		return None
+	# the wrap is process-wide and a bench can serve sites without this app: check before any query
+	if "frappe_cloudflare_r2" not in frappe.get_installed_apps():
+		return None
 
-	from frappe_cloudflare_r2.storage import is_local_url, key_from_url
+	from frappe_cloudflare_r2.storage import is_local_url, key_from_url, side_for
 
 	File = frappe.qb.DocType("File")
 	rows = (
@@ -136,11 +139,8 @@ def r2_file(file_name):
 	file_url, is_private, name = rows[0]
 	if not file_url or is_local_url(file_url):
 		return None
-	# the wrap is process-wide and a bench can serve sites without this app
-	if "frappe_cloudflare_r2" not in frappe.get_installed_apps():
-		return None
 	key = key_from_url(file_url)
-	return (key, is_private, name) if key else None
+	return (key, side_for(key, is_private), name) if key else None
 
 
 def _logger():

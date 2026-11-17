@@ -22,6 +22,8 @@ from frappe import _
 from frappe.core.doctype.file.file import File
 from frappe.utils import cint, escape_html
 
+from frappe_cloudflare_r2.storage import side_for
+
 OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 ENCODINGS = ("utf-8-sig", "utf-8", "windows-1250", "windows-1252")
 
@@ -67,7 +69,7 @@ class R2FileMixin:
 			return super().get_full_path()
 		from frappe_cloudflare_r2.cache import cached_copy
 
-		return cached_copy(key, self.is_private, self.file_name)
+		return cached_copy(key, side_for(key, self.is_private), self.file_name)
 
 	@contextlib.contextmanager
 	def local_copy(self):
@@ -102,7 +104,7 @@ class R2FileMixin:
 		if key:
 			from frappe_cloudflare_r2.storage import R2
 
-			return R2().get_bytes(key, self.is_private)
+			return R2().get_bytes(key, side_for(key, self.is_private))
 		if self.get("content"):
 			content = self.content
 			return content.encode() if isinstance(content, str) else content
@@ -116,7 +118,7 @@ class R2FileMixin:
 
 		from frappe_cloudflare_r2.storage import R2
 
-		content = R2().get_bytes(key, self.is_private)
+		content = R2().get_bytes(key, side_for(key, self.is_private))
 		encodings = kwargs.get("encodings")
 		if encodings is None:
 			encodings = ENCODINGS
