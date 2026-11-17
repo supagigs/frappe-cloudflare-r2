@@ -8,16 +8,20 @@ import secrets
 import frappe
 from frappe import _
 
+from frappe_cloudflare_r2 import cache
 from frappe_cloudflare_r2.file_log import DOCTYPE as FILE_LOG_DOCTYPE
 from frappe_cloudflare_r2.file_log import log, r2_location
 from frappe_cloudflare_r2.storage import (
 	DEFAULT_IGNORED_DOCTYPES,
 	R2,
+	WRITE_BACK_DOCTYPES,
 	get_settings,
 	is_enabled,
 	is_local_url,
 	key_from_url,
+	key_is_private,
 	private_url_for,
+	side_for,
 )
 
 
@@ -25,7 +29,7 @@ def ignored_doctypes(settings=None):
 	settings = settings or get_settings()
 	configured = [d.strip() for d in (settings.ignored_doctypes or "").splitlines() if d.strip()]
 	from_conf = frappe.conf.get("ignore_r2_upload_for_doctype") or []
-	return set(configured or DEFAULT_IGNORED_DOCTYPES) | set(from_conf)
+	return set(configured or DEFAULT_IGNORED_DOCTYPES) | set(from_conf) | set(WRITE_BACK_DOCTYPES)
 
 
 def local_path(file_url):
@@ -129,6 +133,8 @@ def finish_upload(doc, settings, r2, path, key, size, old_url, note=None):
 		(new_url, old_url),
 	)
 	doc.file_url = new_url
+	# if the request rolls back, File.on_rollback cleans up the server copy under this URL (overrides/file.py)
+	doc.flags.r2_uploaded_from = old_url
 	repoint_attached_field(doc, old_url, new_url)
 	log(
 		"Uploaded",
@@ -275,8 +281,14 @@ def delete_from_r2(doc, method=None):
 	if not key:
 		return
 	r2 = R2(settings)
-	bucket = r2.bucket_for(doc.is_private)
+	is_private = side_for(key, doc.is_private)  # the key's bucket, even if the row was toggled
+	bucket = r2.bucket_for(is_private)
 	where = r2_location(bucket, key)
+	shared = frappe.db.exists("File", {"file_url": doc.file_url, "name": ("!=", doc.name)})
+	if not shared:
+		# the server's cached copy goes with the last File that uses it, whatever happens to the object
+		file_name = doc.file_name
+		frappe.db.after_commit.add(lambda: cache.remove(key, is_private, file_name))
 	if not settings.delete_from_r2_on_trash:
 		log(
 			"Kept",
@@ -288,7 +300,7 @@ def delete_from_r2(doc, method=None):
 			note="'Delete From R2 When File Is Deleted' is off",
 		)
 		return
-	if frappe.db.exists("File", {"file_url": doc.file_url, "name": ("!=", doc.name)}):
+	if shared:
 		log(
 			"Kept",
 			"Skipped",
@@ -300,7 +312,6 @@ def delete_from_r2(doc, method=None):
 		)
 		return
 
-	is_private = doc.is_private
 	days = settings.trash_retention_days or 0
 	trash_key = r2.trash_key(key) if days > 0 else None
 	# Logged inside the transaction: if the deletion is rolled back, so is this row.
@@ -364,7 +375,13 @@ def download_file(key=None, file_name=None, download=None):
 	if not rows:
 		raise frappe.DoesNotExistError(_("File not found"))
 
-	allowed = next((r for r in rows if not r.is_private), None)
+	# Private or public comes from the key's own folder, not the File row: a File whose is_private
+	# was changed after upload still points at the object in its original bucket (RCA-3).
+	is_private = key_is_private(key)
+	if is_private is None:  # a custom r2_key_generator key without a private/public folder
+		is_private = int(any(r.is_private for r in rows))
+	# Free access only when both the object and a File row are public.
+	allowed = None if is_private else next((r for r in rows if not r.is_private), None)
 	if not allowed and frappe.session.user != "Guest":
 		allowed = next((r for r in rows if frappe.has_permission("File", "read", doc=r.name)), None)
 	if not allowed:
@@ -374,7 +391,7 @@ def download_file(key=None, file_name=None, download=None):
 		R2().presigned_url(
 			key,
 			file_name=file_name or allowed.file_name,
-			is_private=allowed.is_private,
+			is_private=is_private,
 			inline=not frappe.utils.cint(download),
 		)
 	)

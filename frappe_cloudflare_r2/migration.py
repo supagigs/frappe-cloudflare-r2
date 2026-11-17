@@ -21,6 +21,7 @@ from frappe.query_builder.functions import IfNull, Max, Min
 from frappe.utils import add_days, cint, now_datetime
 from pypika.terms import Case, Field, Function
 
+from frappe_cloudflare_r2 import cache
 from frappe_cloudflare_r2.controller import ignored_doctypes, local_path
 from frappe_cloudflare_r2.storage import (
 	DOWNLOAD_PREFIX,
@@ -32,6 +33,7 @@ from frappe_cloudflare_r2.storage import (
 	is_local_url,
 	key_from_url,
 	legacy_s3_key,
+	side_for,
 	slug,
 )
 
@@ -306,12 +308,19 @@ def _s3_to_r2(row, r2, s3):
 	}
 
 
-def _r2_to_local(row, r2, settings):
+def _r2_to_local(row, r2, settings, after_commit=None):
+	"""Download the object to the server disk. Its R2 object and cached copies are removed after commit.
+
+	after_commit: where to queue that clean-up (default frappe.db.after_commit). A caller that may
+	still fail after this returns passes its own CallbackManager and queues it only on success.
+	"""
 	key = key_from_url(row.file_url, settings)
 	if not key:
 		raise _Skip("Not an R2 URL")
-	is_private = cint(row.is_private)
-	folder = frappe.get_site_path("private" if is_private else "public", "files")
+	# the bucket comes from the key alone; the local folder takes the stricter of key and row
+	in_private_bucket = side_for(key, row.is_private)
+	dest_private = in_private_bucket or cint(row.is_private)
+	folder = frappe.get_site_path("private" if dest_private else "public", "files")
 	os.makedirs(folder, exist_ok=True)
 	name = slug(row.file_name, "file")
 	base, ext = os.path.splitext(name)
@@ -320,9 +329,24 @@ def _r2_to_local(row, r2, settings):
 		n += 1
 		name = f"{base}-{n}{ext}"
 	path = os.path.join(folder, name)
-	r2.download_to(key, path, is_private)
-	frappe.db.after_commit.add(lambda: _try(r2.delete, key, is_private))
-	return ("/private/files/" if is_private else "/files/") + name, {"source": "Cloudflare R2", "r2_key": key}
+	try:
+		r2.download_to(key, path, in_private_bucket)
+		if dest_private:
+			# row is_private is aggregated by callers and unreliable: make every public row private
+			File = frappe.qb.DocType("File")
+			(
+				frappe.qb.update(File)
+				.set(File.is_private, 1)
+				.where(File.file_url == row.file_url)
+				.where(File.is_private == 0)
+			).run()
+		cleanup = frappe.db.after_commit if after_commit is None else after_commit
+		cleanup.add(lambda: _try(r2.delete, key, in_private_bucket))
+		cleanup.add(lambda: cache.remove(key, in_private_bucket, row.file_name))
+	except Exception:
+		_remove(path)  # our own download: the name was free before it
+		raise
+	return ("/private/files/" if dest_private else "/files/") + name, {"source": "Cloudflare R2", "r2_key": key}
 
 
 def _remove(path):

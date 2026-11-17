@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import frappe
 from frappe import _
+from frappe.utils import cint
 
 SETTINGS_DOCTYPE = "Cloudflare R2 Settings"
 DOWNLOAD_METHOD = "frappe_cloudflare_r2.controller.download_file"
@@ -23,6 +24,10 @@ LEGACY_S3_METHOD = "frappe_s3_attachment.controller.generate_file"
 
 MB = 1024 * 1024
 DEFAULT_IGNORED_DOCTYPES = ("Data Import",)
+# Always kept on the server disk, whatever the settings say: ERPNext writes back into these files
+# through File.get_full_path() (stock_ledger.py for Repost Item Valuation, write_files() for Bank
+# Statement Import). For an R2 file that path is a read-only cache copy, so the write would fail.
+WRITE_BACK_DOCTYPES = ("Repost Item Valuation", "Bank Statement Import")
 
 
 def _boto_config(**extra):
@@ -93,6 +98,27 @@ def key_from_url(file_url, settings=None):
 	if base and file_url.startswith(base + "/"):
 		return unquote(file_url[len(base) + 1 :].split("?", 1)[0])
 	return None
+
+
+def key_is_private(key):
+	"""Visibility of an object from its own key: 1 private, 0 public, None if the key doesn't say.
+
+	Keys made by this app hold a "private" or "public" folder (R2.make_key, s3_to_r2). The key, not
+	the File row, says which bucket the object is in: a File's is_private may have changed after upload.
+	"private" anywhere in the key wins, so a mixed key is treated as private.
+	"""
+	parts = (key or "").split("/")
+	if "private" in parts:
+		return 1
+	if "public" in parts:
+		return 0
+	return None
+
+
+def side_for(key, row_is_private):
+	"""1 if the object is in the private bucket, else 0: from the key, or the File row if the key doesn't say."""
+	from_key = key_is_private(key)
+	return cint(row_is_private) if from_key is None else from_key
 
 
 def is_r2_url(file_url, settings=None):
@@ -241,6 +267,10 @@ class R2:
 
 	def download_to(self, key, path, is_private=True):
 		self.client.download_file(self.bucket_for(is_private), key, path, Config=self.transfer_config())
+
+	def download_fileobj(self, key, fileobj, is_private=True):
+		"""Stream an object into an open binary file (keeps that file's permissions)."""
+		self.client.download_fileobj(self.bucket_for(is_private), key, fileobj, Config=self.transfer_config())
 
 	def exists(self, key, is_private=True):
 		from botocore.exceptions import ClientError

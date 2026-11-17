@@ -43,7 +43,7 @@ from local disk or the <a href="https://cloud.frappe.io/marketplace/apps/frappe_
 | **Local → R2** | One click. Background, batched, resumable. Server copies are deleted after upload. |
 | **S3 → R2** | One click. Reads settings from Frappe S3 Attachment automatically (editable). S3 originals are kept **30 days** (configurable), then deleted. Old S3 links stored in Frappe are rewritten. |
 | **References** | File records, every Attach / Attach Image field (all DocTypes, child tables, custom fields, Single settings like the website logo) and optionally links inside rich text are updated. |
-| **Content access** | Code that reads file bytes (email attachments, Data Import, Prepared Reports) keeps working for files in R2. |
+| **Content access** | Code that reads file bytes (email attachments, Data Import, Prepared Reports) keeps working for files in R2. Code that opens files by their disk path keeps working too ([details](#for-app-developers-reading-r2-files)). |
 | **Exit path** | One click moves everything back to the server disk. |
 
 ## Install
@@ -160,7 +160,8 @@ Rows older than **Keep File Log For (days)** (default 180) are removed daily. Bu
 | Public Bucket | Separate bucket served by the public domain. |
 | Signed URL Expiry | Seconds a private download link is valid (default 120, max 7 days). |
 | Folder | Key prefix. |
-| Keep Local for DocTypes | One per line. `site_config.json` key `ignore_r2_upload_for_doctype` (list) is also honoured. |
+| Keep Local for DocTypes | One per line. `site_config.json` key `ignore_r2_upload_for_doctype` (list) is also honoured. Repost Item Valuation and Bank Statement Import are always kept local. |
+| Server Cache | Private on-disk copies of R2 files for code that opens them by path. Unused copies are removed after N days (default 7), and the total is kept under a limit (default 2048 MB). `0` turns a limit off. The size limit is soft: a copy used in the last hour is never removed for size, so the folder can stay over the limit for a while (logged as a warning). |
 | Multipart Threshold / Part Size / Parallel Parts | Upload tuning for large files. |
 
 Object keys look like `<folder>/<public|private>/<yyyy>/<mm>/<dd>/<DocType>/<random>_<file-name>`. Private keys contain 128 random bits.
@@ -178,6 +179,9 @@ Private file  ─► /api/method/frappe_cloudflare_r2.controller.download_file?k
                   └─► permission check ─► 302 to a signed URL (default 120 s)
 
 Delete  ─► File.on_trash ─► after commit: copy to _trash/, delete original ─► daily purge after N days
+                        └─► after commit: remove the server's cached copy
+
+Path    ─► File.get_full_path() ─► private/r2_cache/<hash><ext> (read-only, downloaded on first use)
 ```
 
 ## Security notes
@@ -194,15 +198,32 @@ Delete  ─► File.on_trash ─► after commit: copy to _trash/, delete origin
 - While Frappe S3 Attachment is still installed, its own upload hook also runs. Migrate, then uninstall it.
 - Another app that also overrides the `File` DocType class may conflict with this one.
 
-## For app developers: reading file bytes
+## For app developers: reading R2 files
 
-Once files live in R2, `open(file_doc.get_full_path())` no longer works, because the path is now a URL. Use:
+The app is a drop-in for Frappe's local storage. Code written for files on the server disk keeps working when they are in R2:
 
 ```python
-content = file_doc.get_raw_content()   # exact bytes, from R2 or local disk
+with open(file_doc.get_full_path(), "rb") as fh:   # works for local and R2 files
+    data = fh.read()
+
+content = file_doc.get_raw_content()   # exact bytes, without touching the disk cache
+
+with file_doc.local_copy() as path:    # explicit form of get_full_path(); refuses folders and non-R2 URLs
+    image = Image.open(path)
 ```
 
-`get_content()` also works, but like Frappe's own version it may decode text-looking files to `str`.
+- **Paths come from a private cache.**
+  - For an R2 file, `get_full_path()` returns a private cached copy in `sites/<site>/private/r2_cache/`, downloaded on first use and then reused. An R2 key never gets new bytes, so a copy can't go stale.
+  - The folder is 0700 and each copy is read-only (0400).
+  - A copy is removed when its last File is deleted. A daily job trims the cache (*Server Cache* settings: unused for 7 days, 2048 MB in total).
+  - **Grace rule:** a copy used in the last hour is never removed for size, because a caller may still be reading it. When a new copy is added, one pass over the folder checks the total; only if it is over the limit are the least recently used copies older than an hour removed.
+  - To empty the cache: `bench --site <site> execute frappe_cloudflare_r2.cache.clear`.
+- **Writing into the path fails.** Writing into `get_full_path()` of an R2 file raises `PermissionError`, because the change would never reach R2. Two ERPNext doctypes write back into their attachment by path, so their files always stay on the server disk: *Repost Item Valuation* and *Bank Statement Import*. If your app does the same, add its DocType to *Keep Local for DocTypes*.
+- **Permissions:** neither `get_raw_content()` nor `local_copy()` checks them. Check `file_doc.has_permission("read")` when the request comes from a user.
+- **Legacy helpers:** `frappe.utils.file_manager.get_file_path()` and `get_file()` (and `pdf_to_base64()` through them) return the same private cached copy for an R2 file, through `compat.py` on Frappe 16. They don't check permissions, for R2 files just as for local files: callers must check `file_doc.has_permission("read")` themselves. Code that builds `private/files/<file_name>` itself (for example with `get_files_path()`) can't find R2 files. Use `frappe.get_doc("File", name).get_full_path()` or `.get_raw_content()`.
+- **R2 files keep their visibility.** Changing *Is Private* on a File stored in R2 is refused for every user, Administrator included: "Change visibility by re-uploading; R2 files keep their visibility." The object stays in the bucket it was uploaded to. Downloads take private or public from the key's own folder (`/private/` or `/public/`), not from the File row.
+- **Write-back files already in R2:** the `move_write_back_files_to_local` patch moves R2 files attached to *Repost Item Valuation* or *Bank Statement Import* back to the server disk on `bench migrate`. A file that can't be moved stays in R2 and gets an Error Log entry titled "Cloudflare R2: write-back file NOT moved back to the server". Run it again after fixing the cause: `bench --site <site> execute frappe_cloudflare_r2.patches.move_write_back_files_to_local.execute`.
+- **In the File form:** Unzip works for R2 zip files. Optimize says it isn't available for R2 images. Private R2 images get no thumbnail, because Frappe would write it to the public folder.
 
 ## Development
 
@@ -214,7 +235,9 @@ bench --site test.local set-config allow_tests true
 bench --site test.local run-tests --app frappe_cloudflare_r2
 ```
 
-The tests run against a local S3-compatible server (moto), covering uploads, multipart uploads, signed downloads, permissions, trash and purge, and all three migrations including S3 retention and old S3 links.
+The tests run against a local S3-compatible server (moto), covering uploads, multipart uploads, signed downloads, permissions, trash and purge, reading R2 files by path through the cache, and all three migrations including S3 retention and old S3 links.
+
+The suite saves the site's Cloudflare R2 Settings and restores them afterwards, and removes only the records it creates. The migration, deferred-retry and log-purge tests act on every file on the site, so they run only in CI (`CI` set) or on a disposable site with `bench --site test.local set-config allow_site_wide_r2_tests 1`.
 
 ## Credits & License
 
