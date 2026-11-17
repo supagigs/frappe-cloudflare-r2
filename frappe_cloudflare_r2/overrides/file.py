@@ -20,7 +20,7 @@ import contextlib
 import frappe
 from frappe import _
 from frappe.core.doctype.file.file import File
-from frappe.utils import escape_html
+from frappe.utils import cint, escape_html
 
 OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 ENCODINGS = ("utf-8-sig", "utf-8", "windows-1250", "windows-1252")
@@ -37,6 +37,23 @@ class R2FileMixin:
 		if self.is_folder or not self.file_url or is_local_url(self.file_url):
 			return None
 		return key_from_url(self.file_url)
+
+	def validate(self):
+		"""Refuse an is_private change on a file stored in R2, for every user (Administrator included).
+
+		The object stays in the bucket it was uploaded to, so the flag and the object would disagree:
+		a private file could be served as public. Visibility is fixed at upload time (RCA-3).
+		"""
+		if not self.is_new() and self._visibility_changed() and self._r2_key():
+			frappe.throw(
+				_("Change visibility by re-uploading; R2 files keep their visibility."),
+				title=_("File is in Cloudflare R2"),
+			)
+		return super().validate()
+
+	def _visibility_changed(self):
+		before = self.get_doc_before_save()
+		return bool(before) and cint(before.is_private) != cint(self.is_private)
 
 	def get_full_path(self):
 		"""Path on this server's disk. For an R2 file: a private, read-only cached copy.

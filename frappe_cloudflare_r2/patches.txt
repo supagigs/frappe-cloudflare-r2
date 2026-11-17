@@ -2,3 +2,4 @@
 
 [post_model_sync]
 frappe_cloudflare_r2.patches.set_cache_defaults
+frappe_cloudflare_r2.patches.move_write_back_files_to_local

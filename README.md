@@ -161,7 +161,7 @@ Rows older than **Keep File Log For (days)** (default 180) are removed daily. Bu
 | Signed URL Expiry | Seconds a private download link is valid (default 120, max 7 days). |
 | Folder | Key prefix. |
 | Keep Local for DocTypes | One per line. `site_config.json` key `ignore_r2_upload_for_doctype` (list) is also honoured. Repost Item Valuation and Bank Statement Import are always kept local. |
-| Server Cache | Private on-disk copies of R2 files for code that opens them by path. Unused copies are removed after N days (default 7), and the total is kept under a limit (default 2048 MB). `0` turns a limit off. |
+| Server Cache | Private on-disk copies of R2 files for code that opens them by path. Unused copies are removed after N days (default 7), and the total is kept under a limit (default 2048 MB). `0` turns a limit off. The size limit is soft: a copy used in the last hour is never removed for size, so the folder can stay over the limit for a while (logged as a warning). |
 | Multipart Threshold / Part Size / Parallel Parts | Upload tuning for large files. |
 
 Object keys look like `<folder>/<public|private>/<yyyy>/<mm>/<dd>/<DocType>/<random>_<file-name>`. Private keys contain 128 random bits.
@@ -216,10 +216,13 @@ with file_doc.local_copy() as path:    # explicit form of get_full_path(); refus
   - For an R2 file, `get_full_path()` returns a private cached copy in `sites/<site>/private/r2_cache/`, downloaded on first use and then reused. An R2 key never gets new bytes, so a copy can't go stale.
   - The folder is 0700 and each copy is read-only (0400).
   - A copy is removed when its last File is deleted. A daily job trims the cache (*Server Cache* settings: unused for 7 days, 2048 MB in total).
+  - **Grace rule:** a copy used in the last hour is never removed for size, because a caller may still be reading it. When a new copy is added, one pass over the folder checks the total; only if it is over the limit are the least recently used copies older than an hour removed.
   - To empty the cache: `bench --site <site> execute frappe_cloudflare_r2.cache.clear`.
 - **Writing into the path fails.** Writing into `get_full_path()` of an R2 file raises `PermissionError`, because the change would never reach R2. Two ERPNext doctypes write back into their attachment by path, so their files always stay on the server disk: *Repost Item Valuation* and *Bank Statement Import*. If your app does the same, add its DocType to *Keep Local for DocTypes*.
 - **Permissions:** neither `get_raw_content()` nor `local_copy()` checks them. Check `file_doc.has_permission("read")` when the request comes from a user.
 - **Not covered:** `frappe.utils.file_manager.get_file()` and `get_file_path()` look up `file_url` and build the path themselves, without the `File` class. For an R2 file they throw "There is some problem with the file url". Code that builds `private/files/<file_name>` itself can't find R2 files either. Use `frappe.get_doc("File", name).get_full_path()` or `.get_raw_content()`.
+- **R2 files keep their visibility.** Changing *Is Private* on a File stored in R2 is refused for every user, Administrator included: "Change visibility by re-uploading; R2 files keep their visibility." The object stays in the bucket it was uploaded to. Downloads take private or public from the key's own folder (`/private/` or `/public/`), not from the File row.
+- **Write-back files already in R2:** the `move_write_back_files_to_local` patch moves R2 files attached to *Repost Item Valuation* or *Bank Statement Import* back to the server disk on `bench migrate`. A file that can't be moved stays in R2 and gets an Error Log entry titled "Cloudflare R2: write-back file NOT moved back to the server". Run it again after fixing the cause: `bench --site <site> execute frappe_cloudflare_r2.patches.move_write_back_files_to_local.execute`.
 - **In the File form:** Unzip works for R2 zip files. Optimize says it isn't available for R2 images. Private R2 images get no thumbnail, because Frappe would write it to the public folder.
 
 ## Development

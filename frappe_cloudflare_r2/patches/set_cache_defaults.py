@@ -24,3 +24,4 @@ def execute():
 	for field, value in DEFAULTS.items():
 		if field not in saved:
 			frappe.db.set_single_value(SETTINGS, field, value)
+	frappe.clear_document_cache(SETTINGS, SETTINGS)  # get_settings() is cached

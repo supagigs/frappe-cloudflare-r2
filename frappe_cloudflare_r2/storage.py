@@ -99,6 +99,21 @@ def key_from_url(file_url, settings=None):
 	return None
 
 
+def key_is_private(key):
+	"""Visibility of an object from its own key: 1 private, 0 public, None if the key doesn't say.
+
+	Keys made by this app hold a "private" or "public" folder (R2.make_key, s3_to_r2). The key, not
+	the File row, says which bucket the object is in: a File's is_private may have changed after upload.
+	"private" anywhere in the key wins, so a mixed key is treated as private.
+	"""
+	parts = (key or "").split("/")
+	if "private" in parts:
+		return 1
+	if "public" in parts:
+		return 0
+	return None
+
+
 def is_r2_url(file_url, settings=None):
 	return key_from_url(file_url, settings) is not None
 

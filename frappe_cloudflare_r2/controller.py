@@ -19,6 +19,7 @@ from frappe_cloudflare_r2.storage import (
 	is_enabled,
 	is_local_url,
 	key_from_url,
+	key_is_private,
 	private_url_for,
 )
 
@@ -373,7 +374,13 @@ def download_file(key=None, file_name=None, download=None):
 	if not rows:
 		raise frappe.DoesNotExistError(_("File not found"))
 
-	allowed = next((r for r in rows if not r.is_private), None)
+	# Private or public comes from the key's own folder, not the File row: a File whose is_private
+	# was changed after upload still points at the object in its original bucket (RCA-3).
+	is_private = key_is_private(key)
+	if is_private is None:  # a custom r2_key_generator key without a private/public folder
+		is_private = int(any(r.is_private for r in rows))
+	# Free access only when both the object and a File row are public.
+	allowed = None if is_private else next((r for r in rows if not r.is_private), None)
 	if not allowed and frappe.session.user != "Guest":
 		allowed = next((r for r in rows if frappe.has_permission("File", "read", doc=r.name)), None)
 	if not allowed:
@@ -383,7 +390,7 @@ def download_file(key=None, file_name=None, download=None):
 		R2().presigned_url(
 			key,
 			file_name=file_name or allowed.file_name,
-			is_private=allowed.is_private,
+			is_private=is_private,
 			inline=not frappe.utils.cint(download),
 		)
 	)

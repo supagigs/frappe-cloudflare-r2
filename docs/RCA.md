@@ -1,5 +1,14 @@
 # Cloudflare R2 app: root-cause analyses (RCA)
 
+## RCA-3: An R2 file's *Is Private* could change while its object stayed in the old bucket (17 Nov 2026, found in review of 1.0.1)
+- **Symptom (found in review, not reported):** a private R2 file switched to public kept its object in the private bucket under a `/private/` key. `download_file` trusted the File row, so Guest got a signed URL for the private object.
+- **Root cause:** R2 objects are never moved between buckets; `is_private` on the File row and the object's real location could disagree. `download_file` decided access and bucket from the row.
+- **Fix (1.0.1):**
+  - `R2FileMixin.validate` refuses an *Is Private* change on a File stored in R2, for every user (Administrator included): "Change visibility by re-uploading; R2 files keep their visibility."
+  - `download_file` takes private or public from the key's own folder (`storage.key_is_private`). Free access needs both a public key and a public row; otherwise File read permission is checked. The signed URL uses the key's bucket. Keys without a `private`/`public` folder (custom `r2_key_generator`) fall back to "private if any row is private".
+  - `cache.remove` deletes both the private and public cached copies, so a row changed before this fix leaves nothing behind.
+- **Tests:** `tests/test_r2_cache_fixes.py`.
+
 ## RCA-2: "[Errno 2] No such file or directory: '/api/method/frappe_cloudflare_r2.controller.download_file?key=…'" (17 Nov 2026)
 - **Symptom:** GrowthOS image upload (`growthos.api.images.upload`) returned 500, and LinkedIn publish failed with "The image is missing or changed after approval". The error was `[Errno 2] No such file or directory: '/api/method/frappe_cloudflare_r2.controller.download_file?key=private/…png'`.
 - **Root cause:**
@@ -20,6 +29,10 @@
   - Two ERPNext doctypes that write back into their file stay on local disk.
   - Only this app changes. Frappe, ERPNext, GrowthOS and the other apps are unchanged and benefit automatically.
   - Status: built and tested on staging (36 passing), under review, not yet released.
+  - **Review fixes (1.0.1):**
+    - **Grace rule:** a cached copy used in the last hour is never removed for size, by the daily sweep or by the size check that runs when a copy is added. The limit is soft and a warning is logged when it can't be met.
+    - **Write-back files already in R2:** the post-model-sync patch `move_write_back_files_to_local` moves them to the server disk through the R2 → local exit path (`migration._r2_to_local`), re-points File rows and Attach fields, and is idempotent. Each failure gets an Error Log entry and the file stays in R2.
+    - **Visibility:** see RCA-3.
 - **Requirement (user decision):** R2 replaces Frappe's default storage. Anything that works with local storage must keep working when R2 is on, in every app, and no other app will change. That rules out D on its own, and calls for C with a design.
 - **Resolution (1.0.1, branch `fix/r2-local-file-access`): C, built as a private cache. B is kept as the explicit API. A is no longer needed.**
   - **C, paths:** for an R2 file, `get_full_path()` returns `sites/<site>/private/r2_cache/<sha256("private"|"public":key)><ext>` (`cache.py`).
