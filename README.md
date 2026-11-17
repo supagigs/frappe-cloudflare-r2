@@ -10,7 +10,7 @@ CDN delivery for public files, permission-checked private files, a 30-day recycl
 from local disk or the <a href="https://cloud.frappe.io/marketplace/apps/frappe_s3_attachment">Frappe S3 Attachment</a> app.
 </p>
 
-<p align="center">Frappe v15 · v16 · MIT · by <a href="https://supagigs.com">Supagigs</a></p>
+<p align="center">Frappe v16 · MIT · by <a href="https://supagigs.com">Supagigs</a></p>
 
 ---
 

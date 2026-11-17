@@ -10,14 +10,18 @@ Requires `pip install "moto[server]"` in the bench env.
 
 import datetime
 import os
+from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
 import boto3
 import frappe
 import requests
+from botocore.exceptions import ClientError
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils import add_to_date, now_datetime, time_diff_in_seconds
 
-from frappe_cloudflare_r2 import controller, migration
+from frappe_cloudflare_r2 import controller, file_log, migration
+from frappe_cloudflare_r2.file_log import deferred_uploads
 from frappe_cloudflare_r2.storage import (
 	DOWNLOAD_PREFIX,
 	R2,
@@ -64,6 +68,7 @@ def configure(**overrides):
 		folder_name="testsite",
 		ignored_doctypes="Data Import",
 		delete_local_after_upload=1,
+		keep_file_on_upload_failure=0,
 		delete_from_r2_on_trash=1,
 		trash_retention_days=30,
 		trash_prefix="_trash",
@@ -282,7 +287,18 @@ class TestCloudflareR2(FrappeTestCase):
 		return frappe.get_all(
 			"R2 File Log",
 			filters={"file_name": file_name, "event": event},
-			fields=["status", "from_location", "to_location", "bucket", "r2_key", "size", "error", "note"],
+			fields=[
+				"name",
+				"event",
+				"status",
+				"from_location",
+				"to_location",
+				"bucket",
+				"r2_key",
+				"size",
+				"error",
+				"note",
+			],
 			order_by="creation desc",
 			limit=1,
 		)
@@ -329,6 +345,74 @@ class TestCloudflareR2(FrappeTestCase):
 		self.assertEqual(failed[0].status, "Failed")
 		self.assertIn("NoSuchBucket", failed[0].error)
 
+	def test_failed_delete_after_rollback_is_logged_as_kept(self):
+		# A bucket lock refuses the delete, so the object must be logged as kept, not removed.
+		class LockedR2(R2):
+			def __init__(self, settings=None):
+				super().__init__(settings)
+				self.client = mock.Mock(wraps=self.client)
+				self.client.delete_object.side_effect = ClientError(
+					{"Error": {"Code": "AccessDenied", "Message": "object is locked"}}, "DeleteObject"
+				)
+
+		name = f"locked-{frappe.generate_hash(length=6)}.txt"
+		with mock.patch.object(controller, "R2", LockedR2):
+			make_file(name, b"locked bytes")
+			frappe.db.rollback()
+		kept = self._log(name, "Kept")
+		self.assertTrue(kept)
+		self.assertEqual(kept[0].status, "Failed")
+		self.assertIn("AccessDenied", kept[0].error)
+		self.assertIn("kept", kept[0].note)
+		self.assertFalse(self._log(name, "Rolled Back"))
+		# the object is still in the bucket
+		raw_client().head_object(Bucket=R2_BUCKET, Key=kept[0].r2_key)
+
+	def test_deferred_upload_retries_after_outage_and_reports_age(self):
+		configure(keep_file_on_upload_failure=1, bucket_name="bucket-that-does-not-exist")
+		name = f"deferred-{frappe.generate_hash(length=6)}.txt"
+		# unique bytes: Frappe de-duplicates Files by content, and committed rows persist between runs
+		content = f"deferred bytes {name}".encode()
+		doc = make_file(name, content)
+		commit()
+
+		# the email is kept: the File still points at the server copy, no exception was raised
+		self.assertTrue(doc.file_url.startswith("/private/files/"))
+		self.assertTrue(os.path.isfile(frappe.get_site_path("private", "files", name)))
+		row = self._log(name, "Upload Deferred")[0]
+		self.assertEqual(row.status, "Deferred")
+		self.assertEqual(row.from_location, doc.file_url)
+		self.assertTrue(row.r2_key)
+
+		# the age is reported, and a 60 minute alert only lists files that have waited that long
+		self.assertEqual([d["file"] for d in deferred_uploads()].count(doc.name), 1)
+		self.assertEqual(frappe.db.get_value("R2 File Log", row.name, "status"), "Deferred")
+		self.assertFalse([d for d in deferred_uploads(older_than_minutes=60) if d["file"] == doc.name])
+		frappe.db.set_value("R2 File Log", row.name, "creation", add_to_date(now_datetime(), minutes=-90))
+		commit()
+		old = [d for d in deferred_uploads(older_than_minutes=60) if d["file"] == doc.name]
+		self.assertEqual(len(old), 1)
+		self.assertGreaterEqual(old[0]["age_minutes"], 89)
+
+		# still down: the retry leaves the file deferred
+		controller.retry_deferred_uploads()
+		commit()
+		self.assertEqual(frappe.db.get_value("File", doc.name, "file_url"), doc.file_url)
+		self.assertEqual(frappe.db.get_value("R2 File Log", row.name, "status"), "Deferred")
+
+		# outage over: the next retry uploads it under the key chosen at deferral
+		configure(keep_file_on_upload_failure=1, bucket_name=R2_BUCKET)
+		controller.retry_deferred_uploads()
+		commit()
+		new_url = frappe.db.get_value("File", doc.name, "file_url")
+		self.assertTrue(new_url.startswith(DOWNLOAD_PREFIX))
+		self.assertEqual(key_from_url(new_url), row.r2_key)
+		body = raw_client().get_object(Bucket=R2_BUCKET, Key=row.r2_key)["Body"].read()
+		self.assertEqual(body, content)
+		self.assertEqual(frappe.db.get_value("R2 File Log", row.name, "status"), "Success")
+		self.assertEqual(self._log(name, "Uploaded")[0].note, "Uploaded on retry after an R2 outage")
+		self.assertFalse([d for d in deferred_uploads() if d["file"] == doc.name])
+
 	def test_file_log_purge(self):
 		doc = make_file(f"purge-{frappe.generate_hash(length=6)}.txt")
 		commit()
@@ -337,6 +421,55 @@ class TestCloudflareR2(FrappeTestCase):
 		commit()
 		migration.purge_r2_trash(older_than_days=-1)  # everything in trash counts as expired
 		self.assertTrue(frappe.db.exists("R2 File Log", {"event": "Purged", "r2_key": ("like", f"%{key}")}))
+
+	def test_file_log_purge_keeps_deferred_rows(self):
+		frappe.db.set_single_value("Cloudflare R2 Settings", "file_log_retention_days", 180)
+		tag = frappe.generate_hash(length=6)
+		url = f"/private/files/purge-deferred-{tag}.txt"
+		old = add_to_date(now_datetime(), days=-200)
+
+		file_log.log("Upload Deferred", status="Deferred", from_location=url, r2_key=f"testsite/{tag}.txt")
+		file_log.log("Uploaded", status="Success", from_location=url, r2_key=f"testsite/{tag}-done.txt")
+		rows = {
+			r.event: r.name
+			for r in frappe.get_all(
+				"R2 File Log", filters={"from_location": url}, fields=["name", "event"]
+			)
+		}
+		self.assertEqual(set(rows), {"Upload Deferred", "Uploaded"})
+		for name in rows.values():
+			frappe.db.set_value("R2 File Log", name, "creation", old)
+		commit()
+
+		file_log.purge_old_logs()
+		commit()
+
+		# the 200-day-old deferred row survives and is still listed for retry
+		self.assertEqual(frappe.db.get_value("R2 File Log", rows["Upload Deferred"], "status"), "Deferred")
+		self.assertTrue([d for d in deferred_uploads(older_than_minutes=60) if d["file_url"] == url])
+		# the 200-day-old non-deferred row is purged
+		self.assertFalse(frappe.db.exists("R2 File Log", rows["Uploaded"]))
+
+	def test_deferred_uploads_one_entry_per_file_with_oldest_deferral(self):
+		tag = frappe.generate_hash(length=6)
+		url = f"/private/files/dedupe-{tag}.txt"
+		file_log.log("Upload Deferred", status="Deferred", from_location=url, r2_key=f"testsite/{tag}-a.txt")
+		file_log.log("Upload Deferred", status="Deferred", from_location=url, r2_key=f"testsite/{tag}-b.txt")
+		names = frappe.get_all(
+			"R2 File Log", filters={"from_location": url}, pluck="name", order_by="creation asc"
+		)
+		self.assertEqual(len(names), 2)
+		older = add_to_date(now_datetime(), minutes=-120)
+		frappe.db.set_value("R2 File Log", names[0], "creation", older)
+		frappe.db.set_value("R2 File Log", names[1], "creation", add_to_date(now_datetime(), minutes=-10))
+		commit()
+
+		entries = [d for d in deferred_uploads() if d["file_url"] == url]
+		self.assertEqual(len(entries), 1)
+		self.assertLess(abs(time_diff_in_seconds(entries[0]["deferred_at"], older)), 1)
+		self.assertGreaterEqual(entries[0]["age_minutes"], 119)
+		self.assertEqual(entries[0]["log"], names[0])
+		self.assertEqual(len([d for d in deferred_uploads(older_than_minutes=60) if d["file_url"] == url]), 1)
 
 	# -- migrations ----------------------------------------------------------------
 
