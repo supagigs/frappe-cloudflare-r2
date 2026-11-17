@@ -35,6 +35,10 @@
   "column_break_ret",
   "trash_prefix",
   "file_log_retention_days",
+  "cache_section",
+  "cache_retention_days",
+  "column_break_cache",
+  "cache_max_size_mb",
   "migration_section",
   "migration_help",
   "rewrite_text_links",
@@ -163,7 +167,7 @@
    "fieldtype": "Small Text",
    "label": "Keep Local for DocTypes",
    "default": "Data Import",
-   "description": "One DocType per line. Files attached to these stay on the server disk (same behaviour as frappe_s3_attachment). site_config key <code>ignore_r2_upload_for_doctype</code> is also honoured."
+   "description": "One DocType per line. Files attached to these stay on the server disk (same behaviour as frappe_s3_attachment). site_config key <code>ignore_r2_upload_for_doctype</code> is also honoured. Repost Item Valuation and Bank Statement Import always stay on the server disk, because ERPNext writes back into those files."
   },
   {
    "fieldname": "delete_local_after_upload",
@@ -238,6 +242,31 @@
    "label": "Keep File Log For (days)",
    "default": "180",
    "description": "Rows in R2 File Log older than this are deleted daily. 0 keeps them forever."
+  },
+  {
+   "fieldname": "cache_section",
+   "fieldtype": "Section Break",
+   "label": "Server Cache",
+   "collapsible": 1,
+   "description": "Code that opens an R2 file by its path (File.get_full_path()) gets a private, read-only copy kept in sites/&lt;site&gt;/private/r2_cache. Copies are downloaded on first use, removed when the file is deleted, and trimmed daily."
+  },
+  {
+   "fieldname": "cache_retention_days",
+   "fieldtype": "Int",
+   "label": "Remove Copies Unused For (days)",
+   "default": "7",
+   "description": "0 keeps unused copies until the size limit is reached."
+  },
+  {
+   "fieldname": "column_break_cache",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "cache_max_size_mb",
+   "fieldtype": "Int",
+   "label": "Cache Size Limit (MB)",
+   "default": "2048",
+   "description": "The least recently used copies are removed daily until the cache is under this size. 0 means no limit."
   },
   {
    "fieldname": "migration_section",
@@ -337,7 +366,7 @@
  "issingle": 1,
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-10-28 18:00:00.000000",
+ "modified": "2026-11-17 16:00:00.000000",
  "modified_by": "Administrator",
  "module": "Cloudflare R2",
  "name": "Cloudflare R2 Settings",

@@ -9,14 +9,13 @@ zip downloads...) work for files stored in Cloudflare R2.
 * Frappe v15 has no extension hook, so R2File (mixin + core File) is registered through
   `override_doctype_class` on v15 only (see hooks.py).
 
-A file in R2 has no path on this server. Read it with `get_raw_content()`, or, for a library that
-needs a path (PIL, PDF tools, zipfile), with `with file_doc.local_copy() as path:`.
-`get_full_path()` raises R2FileNotOnDiskError for such a file instead of returning its URL.
+Drop-in for local storage: code written for files on the server disk keeps working when they
+are in R2. `get_full_path()` returns a private cached copy of an R2 file (frappe_cloudflare_r2/cache.py),
+so `open(file_doc.get_full_path())`, PIL, PDF tools and zipfile work unchanged. Lifecycle methods
+(validate, rollback, exists_on_disk, content reads) act on the R2 object, never on the cache.
 """
 
 import contextlib
-import os
-import tempfile
 
 import frappe
 from frappe import _
@@ -25,10 +24,6 @@ from frappe.utils import escape_html
 
 OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 ENCODINGS = ("utf-8-sig", "utf-8", "windows-1250", "windows-1252")
-
-
-class R2FileNotOnDiskError(frappe.ValidationError):
-	"""Code asked for the disk path of a file that is stored in Cloudflare R2."""
 
 
 def logger():
@@ -44,43 +39,33 @@ class R2FileMixin:
 		return key_from_url(self.file_url)
 
 	def get_full_path(self):
-		"""Path on this server's disk. Raises R2FileNotOnDiskError for a file stored in R2.
+		"""Path on this server's disk. For an R2 file: a private, read-only cached copy.
 
 		Frappe would return the R2 download URL unchanged, and opening it fails with
-		"[Errno 2] No such file or directory: '/api/method/...'".
+		"[Errno 2] No such file or directory: '/api/method/...'". The copy is read-only (0400), so
+		code that writes into the path fails loudly instead of changing a copy nobody uploads.
 		"""
-		if self.flags.r2_local_path:
-			return self.flags.r2_local_path  # set only while unzip() works on a temporary copy
-		if self._r2_key():
-			frappe.throw(
-				_(
-					"File {0} is stored in Cloudflare R2, not on disk. "
-					"Use file_doc.get_raw_content() or `with file_doc.local_copy() as path:`."
-				).format(escape_html(self.file_name or self.name)),
-				exc=R2FileNotOnDiskError,
-				title=_("File is in Cloudflare R2"),
-			)
-		return super().get_full_path()
+		key = self._r2_key()
+		if not key:
+			return super().get_full_path()
+		from frappe_cloudflare_r2.cache import cached_copy
+
+		return cached_copy(key, self.is_private, self.file_name)
 
 	@contextlib.contextmanager
 	def local_copy(self):
 		"""Yield a real path on this server's disk holding the file's bytes.
 
-		The supported way to hand a file to a library that needs a path (PIL, PDF tools, zipfile):
-
 		    with file_doc.local_copy() as path:
 		        image = Image.open(path)
 
-		* Local file: yields its own path. Don't change or delete it.
-		* R2 file: downloads it to a private temporary file in the system temp folder (mode 0600,
-		  same extension), yields that path and always deletes it afterwards, even if the block raises.
-
-		Like get_raw_content(), this does not check permissions; the caller must.
+		The explicit form of get_full_path(): a local file's own path, or the private cached copy of
+		an R2 file (read-only; don't change or delete it). Unlike get_full_path(), it refuses folders
+		and remote URLs that are not R2. Like get_raw_content(), it does not check permissions.
 		"""
 		if self.is_folder:
 			frappe.throw(_("Cannot get file contents of a Folder"))
-		key = self._r2_key()
-		if not key:
+		if not self._r2_key():
 			if self.is_remote_file:
 				frappe.throw(
 					_("File {0} is not stored on this server or in Cloudflare R2.").format(
@@ -88,20 +73,7 @@ class R2FileMixin:
 					)
 				)
 			self.validate_file_path()
-			yield self.get_full_path()
-			return
-
-		from frappe_cloudflare_r2.storage import R2
-
-		suffix = os.path.splitext(self.file_name or key)[1]
-		fd, path = tempfile.mkstemp(prefix="r2-", suffix=suffix)  # created with mode 0600
-		try:
-			with os.fdopen(fd, "wb") as fh:
-				R2().download_fileobj(key, fh, self.is_private)
-			yield path
-		finally:
-			with contextlib.suppress(FileNotFoundError):
-				os.remove(path)
+		yield self.get_full_path()
 
 	def get_raw_content(self) -> bytes:
 		"""Exact bytes of the file wherever it is stored (R2 or local disk), never decoded.
@@ -160,26 +132,17 @@ class R2FileMixin:
 		The R2 object itself is removed by the upload's own rollback callback (controller.py).
 		"""
 		local_url = self.flags.r2_uploaded_from
-		if not (local_url and self._r2_key()):
+		key = self._r2_key()
+		if not (local_url and key):
 			return super().on_rollback()
+		from frappe_cloudflare_r2 import cache
+
+		cache.remove(key, self.is_private, self.file_name)  # in case the request read its path
 		r2_url, self.file_url = self.file_url, local_url
 		try:
 			return super().on_rollback()
 		finally:
 			self.file_url = r2_url
-
-	def unzip(self):
-		if not self._r2_key():
-			return super().unzip()
-		if not self.file_url.endswith(".zip"):
-			frappe.throw(_("{0} is not a zip file").format(escape_html(self.file_name)))
-		self.check_permission("read")  # before downloading anything
-		with self.local_copy() as path:
-			self.flags.r2_local_path = path
-			try:
-				return super().unzip()
-			finally:
-				self.flags.r2_local_path = None
 
 	def make_thumbnail(self, *args, **kwargs):
 		# A private image's thumbnail would be written to the public files folder, so skip it.

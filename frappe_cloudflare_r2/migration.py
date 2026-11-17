@@ -21,6 +21,7 @@ from frappe.query_builder.functions import IfNull, Max, Min
 from frappe.utils import add_days, cint, now_datetime
 from pypika.terms import Case, Field, Function
 
+from frappe_cloudflare_r2 import cache
 from frappe_cloudflare_r2.controller import ignored_doctypes, local_path
 from frappe_cloudflare_r2.storage import (
 	DOWNLOAD_PREFIX,
@@ -322,6 +323,7 @@ def _r2_to_local(row, r2, settings):
 	path = os.path.join(folder, name)
 	r2.download_to(key, path, is_private)
 	frappe.db.after_commit.add(lambda: _try(r2.delete, key, is_private))
+	frappe.db.after_commit.add(lambda: cache.remove(key, is_private, row.file_name))
 	return ("/private/files/" if is_private else "/files/") + name, {"source": "Cloudflare R2", "r2_key": key}
 
 

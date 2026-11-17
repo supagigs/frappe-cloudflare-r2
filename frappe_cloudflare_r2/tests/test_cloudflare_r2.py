@@ -17,6 +17,7 @@ import contextlib
 import datetime
 import functools
 import os
+import time
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
@@ -27,7 +28,7 @@ from botocore.exceptions import ClientError
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import add_to_date, now_datetime, time_diff_in_seconds
 
-from frappe_cloudflare_r2 import controller, file_log, migration
+from frappe_cloudflare_r2 import cache, controller, file_log, migration
 from frappe_cloudflare_r2.file_log import deferred_uploads
 from frappe_cloudflare_r2.storage import (
 	DOWNLOAD_PREFIX,
@@ -44,9 +45,10 @@ CREATED_FILES, CREATED_TODOS = [], []
 
 
 def setUpModule():
-	global SAVED_SETTINGS, STARTED
+	global SAVED_SETTINGS, STARTED, CACHE_BEFORE
 	SAVED_SETTINGS = snapshot_settings()
 	STARTED = now_datetime()
+	CACHE_BEFORE = cache_listing()
 
 	from moto.server import ThreadedMotoServer
 
@@ -64,6 +66,7 @@ def setUpModule():
 def tearDownModule():
 	try:
 		remove_created_records()
+		remove_created_cache_files()
 	finally:
 		restore_settings(SAVED_SETTINGS)
 		SERVER.stop()
@@ -130,6 +133,22 @@ def remove_created_records():
 	frappe.db.commit()
 
 
+def cache_listing():
+	path = os.path.abspath(frappe.get_site_path("private", cache.FOLDER))
+	return set(os.listdir(path)) if os.path.isdir(path) else None
+
+
+def remove_created_cache_files():
+	"""Remove the cached copies made during the run, and the folder if the run created it."""
+	path = os.path.abspath(frappe.get_site_path("private", cache.FOLDER))
+	for name in (cache_listing() or set()) - (CACHE_BEFORE or set()):
+		with contextlib.suppress(FileNotFoundError):
+			os.remove(os.path.join(path, name))
+	if CACHE_BEFORE is None:
+		with contextlib.suppress(OSError):
+			os.rmdir(path)
+
+
 def site_wide(test):
 	"""Skip a test that migrates, retries or purges every File or log row on the site."""
 
@@ -174,6 +193,8 @@ def configure(**overrides):
 		s3_endpoint_url=ENDPOINT,
 		s3_access_key_id="k",
 		s3_source_retention_days=30,
+		cache_retention_days=7,
+		cache_max_size_mb=2048,
 	)
 	values.update(overrides)
 	# db writes bypass validate(), which (correctly) insists on https endpoints
@@ -539,9 +560,7 @@ class TestCloudflareR2(R2TestCase):
 		file_log.log("Uploaded", status="Success", from_location=url, r2_key=f"testsite/{tag}-done.txt")
 		rows = {
 			r.event: r.name
-			for r in frappe.get_all(
-				"R2 File Log", filters={"from_location": url}, fields=["name", "event"]
-			)
+			for r in frappe.get_all("R2 File Log", filters={"from_location": url}, fields=["name", "event"])
 		}
 		self.assertEqual(set(rows), {"Upload Deferred", "Uploaded"})
 		for name in rows.values():
@@ -715,7 +734,7 @@ class TestCloudflareR2(R2TestCase):
 		self.assertEqual(q["key"], ["a/b"])
 
 
-# -- reading R2 files through a disk path (RCA-2) -----------------------------------
+# -- R2 as a drop-in for local storage: real paths through the cache (RCA-2) ----------
 
 
 def png_bytes(size=(40, 30)):
@@ -739,22 +758,10 @@ def zip_bytes(members):
 	return buf.getvalue()
 
 
-class TempPaths:
-	"""Records every temporary file local_copy() creates."""
-
-	def __init__(self):
-		self.paths = []
-
-	def mkstemp(self, *args, **kwargs):
-		import tempfile
-
-		fd, path = tempfile.mkstemp(*args, **kwargs)
-		self.paths.append(path)
-		return fd, path
-
-	def patch(self):
-		# replaces the module reference in overrides/file.py only, not the global tempfile module
-		return mock.patch("frappe_cloudflare_r2.overrides.file.tempfile", self)
+def age(path, days):
+	"""Pretend a cached copy was last used `days` ago."""
+	stamp = time.time() - days * 24 * 60 * 60
+	os.utime(path, (stamp, stamp))
 
 
 class TestLocalFileAccess(R2TestCase):
@@ -764,108 +771,196 @@ class TestLocalFileAccess(R2TestCase):
 		self.assertTrue(key_from_url(doc.file_url))
 		return frappe.get_doc("File", doc.name)
 
-	# -- local_copy -------------------------------------------------------------------
+	def downloads(self):
+		return mock.patch.object(R2, "download_fileobj", autospec=True, side_effect=R2.download_fileobj)
 
-	def test_local_copy_of_r2_file_is_private_temp_file_removed_after(self):
-		import stat
-		import tempfile
+	# -- get_full_path gives a real path ------------------------------------------------
 
-		content = png_bytes()
-		doc = self.r2_file(f"copy-{frappe.generate_hash(length=6)}.png", content)
+	def test_growthos_pattern_open_full_path_of_r2_image(self):
+		from io import BytesIO
+
+		from PIL import Image
+
+		content = png_bytes((64, 48))
+		doc = self.r2_file(f"post-{frappe.generate_hash(length=6)}.png", content)
+		with open(doc.get_full_path(), "rb") as fh:  # failed with [Errno 2] before
+			self.assertEqual(fh.read(), content)
+		with Image.open(doc.get_full_path()) as image:
+			self.assertEqual(image.size, (64, 48))
 		with doc.local_copy() as path:
-			self.assertTrue(path.endswith(".png"))
-			self.assertEqual(os.path.dirname(path), tempfile.gettempdir())
-			self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
-			with open(path, "rb") as fh:
-				self.assertEqual(fh.read(), content)
-		self.assertFalse(os.path.exists(path))
+			self.assertEqual(path, doc.get_full_path())
+		with Image.open(BytesIO(doc.get_raw_content())) as image:
+			self.assertEqual(image.size, (64, 48))
 
-	def test_local_copy_of_local_file_is_its_own_path_and_kept(self):
+	def test_public_r2_file_full_path(self):
+		configure(public_base_url="https://files.example.com", public_bucket_name=PUBLIC_BUCKET)
+		content = frappe.generate_hash().encode()
+		doc = self.r2_file(f"public-{frappe.generate_hash(length=6)}.txt", content, is_private=0)
+		with open(doc.get_full_path(), "rb") as fh:
+			self.assertEqual(fh.read(), content)
+
+	def test_full_path_of_local_file_unchanged(self):
 		configure(enabled=0)
 		content = frappe.generate_hash().encode()
-		doc = make_file(f"local-{frappe.generate_hash(length=6)}.txt", content)
-		self.assertTrue(doc.file_url.startswith("/private/files/"))
-		with frappe.get_doc("File", doc.name).local_copy() as path:
-			self.assertEqual(os.path.realpath(path), os.path.realpath(controller.local_path(doc.file_url)))
-			with open(path, "rb") as fh:
-				self.assertEqual(fh.read(), content)
+		doc = frappe.get_doc("File", make_file(f"plain-{frappe.generate_hash(length=6)}.txt", content).name)
+		path = doc.get_full_path()
+		self.assertEqual(os.path.realpath(path), os.path.realpath(controller.local_path(doc.file_url)))
+		with doc.local_copy() as copy:
+			self.assertEqual(copy, path)
 		self.assertTrue(os.path.exists(path))
 
-	def test_local_copy_removed_when_the_block_raises(self):
-		doc = self.r2_file("raises.txt", frappe.generate_hash().encode())
-		with self.assertRaises(ZeroDivisionError):
-			with doc.local_copy() as path:
-				self.assertTrue(os.path.exists(path))
-				1 / 0  # noqa: B018
+	# -- the cache --------------------------------------------------------------------------
+
+	def test_cached_copy_is_private_and_read_only(self):
+		import hashlib
+		import stat
+
+		doc = self.r2_file(f"private-{frappe.generate_hash(length=6)}.png", png_bytes())
+		path = doc.get_full_path()
+		folder = os.path.abspath(frappe.get_site_path("private", cache.FOLDER))
+		self.assertEqual(os.path.dirname(path), folder)
+		self.assertNotIn(os.sep + "public" + os.sep, path)
+		key = key_from_url(doc.file_url)
+		self.assertEqual(
+			os.path.basename(path), hashlib.sha256(f"private:{key}".encode()).hexdigest() + ".png"
+		)
+		self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o400)
+		self.assertEqual(stat.S_IMODE(os.stat(folder).st_mode), 0o700)
+
+	def test_write_into_cached_copy_fails_loudly(self):
+		# Write-back: a write would change a copy that is never uploaded, so it must fail, not vanish.
+		if os.geteuid() == 0:
+			self.skipTest("root ignores file permissions")
+		content = frappe.generate_hash().encode()
+		doc = self.r2_file("write-back.txt", content)
+		with self.assertRaises(PermissionError):
+			with open(doc.get_full_path(), "wb") as fh:
+				fh.write(b"changed")
+		self.assertEqual(doc.get_raw_content(), content)
+		with open(doc.get_full_path(), "rb") as fh:
+			self.assertEqual(fh.read(), content)
+
+	def test_write_back_doctypes_always_stay_local(self):
+		configure(ignored_doctypes="ToDo")
+		self.assertTrue(
+			{"Repost Item Valuation", "Bank Statement Import", "ToDo"} <= controller.ignored_doctypes()
+		)
+
+	def test_cached_copy_is_reused_and_marked_used(self):
+		doc = self.r2_file("reuse.txt", frappe.generate_hash().encode())
+		with self.downloads() as download:
+			path = frappe.get_doc("File", doc.name).get_full_path()
+			age(path, 3)
+			self.assertEqual(frappe.get_doc("File", doc.name).get_full_path(), path)
+			with frappe.get_doc("File", doc.name).local_copy() as copy:
+				self.assertEqual(copy, path)
+		self.assertEqual(download.call_count, 1)
+		self.assertLess(time.time() - os.stat(path).st_mtime, 60)
+
+	def test_failed_download_leaves_nothing_in_the_cache(self):
+		doc = self.r2_file("download-fails.txt", frappe.generate_hash().encode())
+		before = cache_listing() or set()
+		with mock.patch.object(R2, "download_fileobj", side_effect=ClientError({}, "GetObject")):
+			with self.assertRaises(ClientError):
+				doc.get_full_path()
+		self.assertEqual(cache_listing() or set(), before)
+
+	def test_cached_copy_removed_when_last_file_is_deleted(self):
+		doc = self.r2_file(
+			f"shared-cache-{frappe.generate_hash(length=6)}.txt", frappe.generate_hash().encode()
+		)
+		path = doc.get_full_path()
+		copy = frappe.get_doc(
+			{"doctype": "File", "file_url": doc.file_url, "file_name": doc.file_name, "is_private": 1}
+		).insert(ignore_permissions=True)
+		CREATED_FILES.append(copy.name)
+		commit()
+		frappe.delete_doc("File", doc.name)
+		commit()
+		self.assertTrue(os.path.exists(path))  # another File still uses the object
+		frappe.delete_doc("File", copy.name)
+		commit()
 		self.assertFalse(os.path.exists(path))
 
-	def test_local_copy_removed_when_the_download_fails(self):
-		doc = self.r2_file("download-fails.txt", frappe.generate_hash().encode())
-		temp = TempPaths()
-		with (
-			temp.patch(),
-			mock.patch.object(R2, "download_fileobj", side_effect=ClientError({}, "GetObject")),
-		):
-			with self.assertRaises(ClientError):
-				with doc.local_copy():
-					self.fail("the block must not run")
-		self.assertEqual(len(temp.paths), 1)
-		self.assertFalse(os.path.exists(temp.paths[0]))
+	def test_sweep_removes_unused_copies_then_least_recently_used_over_the_limit(self):
+		paths = [self.r2_file(f"sweep-{n}.bin", os.urandom(600 * 1024)).get_full_path() for n in range(3)]
+		unused, older, newer = paths
+		age(unused, 10)
+		age(older, 2)
+		age(newer, 1)
+		stale_temp = os.path.join(os.path.dirname(unused), cache.TEMP_PREFIX + "left-over")
+		with open(stale_temp, "wb") as fh:
+			fh.write(b"x")
+		age(stale_temp, 2)
 
-	# -- get_full_path: a clear error instead of the URL ---------------------------------
+		self.assertGreaterEqual(cache.sweep(retention_days=7, max_size_mb=0), 2)
+		self.assertFalse(os.path.exists(unused))
+		self.assertFalse(os.path.exists(stale_temp))
+		self.assertTrue(os.path.exists(older) and os.path.exists(newer))
 
-	def test_get_full_path_on_r2_file_raises_clear_error(self):
-		from frappe_cloudflare_r2.overrides.file import R2FileNotOnDiskError
+		# 1.2 MB left; a 1 MB limit removes the least recently used copy
+		configure(cache_retention_days=7, cache_max_size_mb=1)
+		cache.sweep()
+		self.assertFalse(os.path.exists(older))
+		self.assertTrue(os.path.exists(newer))
 
-		configure(public_base_url="https://files.example.com", public_bucket_name=PUBLIC_BUCKET)
-		for is_private in (1, 0):
-			doc = self.r2_file(f"path-{is_private}.txt", frappe.generate_hash().encode(), is_private)
-			with self.assertRaises(R2FileNotOnDiskError) as cm:
-				open(doc.get_full_path(), "rb")  # the pattern that failed with [Errno 2]
-			self.assertIsInstance(cm.exception, frappe.ValidationError)
-			self.assertIn("stored in Cloudflare R2, not on disk", str(cm.exception))
-			self.assertIn("get_raw_content()", str(cm.exception))
-			self.assertIn("local_copy()", str(cm.exception))
+	def test_clear_removes_every_copy(self):
+		path = self.r2_file("clear.txt", frappe.generate_hash().encode()).get_full_path()
+		self.assertGreaterEqual(cache.clear(), 1)
+		self.assertFalse(os.path.exists(path))
 
-	def test_get_full_path_of_local_file_unchanged(self):
-		configure(enabled=0)
-		doc = make_file(f"plain-{frappe.generate_hash(length=6)}.txt")
-		path = frappe.get_doc("File", doc.name).get_full_path()
-		self.assertEqual(os.path.realpath(path), os.path.realpath(controller.local_path(doc.file_url)))
+	# -- core File flows act on R2, not the cache ------------------------------------------
 
-	# -- core File flows still work for R2 files ------------------------------------------
-
-	def test_validate_and_save_r2_file(self):
+	def test_validate_and_save_r2_file_without_download(self):
 		doc = self.r2_file("save-me.txt", frappe.generate_hash().encode())
-		self.assertTrue(doc.exists_on_disk())
-		doc.file_name = "renamed.txt"
-		doc.save()  # validate() calls validate_file_on_disk() -> get_full_path() in core
-		commit()
+		with self.downloads() as download:
+			self.assertTrue(doc.exists_on_disk())
+			doc.file_name = "renamed.txt"
+			doc.save()  # validate() -> validate_file_on_disk() calls get_full_path() in core
+			commit()
+		download.assert_not_called()
 		self.assertEqual(frappe.db.get_value("File", doc.name, "file_name"), "renamed.txt")
 
-	def test_delete_r2_file_loaded_fresh_moves_object_to_trash(self):
+	def test_delete_r2_file_moves_object_to_trash_and_removes_copy(self):
 		doc = self.r2_file("delete-fresh.txt", frappe.generate_hash().encode())
 		key = key_from_url(doc.file_url)
+		path = doc.get_full_path()
 		frappe.delete_doc("File", doc.name)
 		commit()
 		self.assertFalse(frappe.db.exists("File", doc.name))
+		self.assertFalse(os.path.exists(path))
 		r2 = R2()
 		self.assertFalse(r2.exists(key))
 		self.assertTrue([o for o in r2._iter_objects(R2_BUCKET, r2.trash_prefix()) if o["Key"].endswith(key)])
 
-	def test_rollback_after_upload_removes_object_and_server_copy(self):
+	def test_rollback_after_upload_removes_object_server_copy_and_cached_copy(self):
 		doc = make_file(f"rollback-{frappe.generate_hash(length=6)}.txt", frappe.generate_hash().encode())
 		key = key_from_url(doc.file_url)
 		server_copy = frappe.get_site_path("private", "files", doc.file_name)
-		self.assertTrue(os.path.exists(server_copy))
-		self.assertTrue(R2().exists(key))
+		cached = doc.get_full_path()
+		self.assertTrue(os.path.exists(server_copy) and os.path.exists(cached))
 		frappe.db.rollback()
 		self.assertFalse(frappe.db.exists("File", doc.name))
 		self.assertFalse(R2().exists(key))
 		self.assertFalse(os.path.exists(server_copy))
-		self.assertEqual(key_from_url(doc.file_url), key)  # the in-memory doc is left as it was
+		self.assertFalse(os.path.exists(cached))
 
-	# -- thumbnails, optimisation, unzip ------------------------------------------------------
+	def test_unzip_r2_zip(self):
+		members = {"a.txt": frappe.generate_hash().encode(), "b.bin": os.urandom(32)}
+		doc = self.r2_file(f"bundle-{frappe.generate_hash(length=6)}.zip", zip_bytes(members))
+		zip_copy = cache.path_for(key_from_url(doc.file_url), 1, doc.file_name)
+		children = doc.unzip()
+		CREATED_FILES.extend(c.name for c in children)
+		commit()
+		self.assertEqual({c.file_name for c in children}, set(members))
+		for child in children:
+			fresh = frappe.get_doc("File", child.name)
+			self.assertTrue(key_from_url(fresh.file_url))
+			self.assertEqual(fresh.get_raw_content(), members[child.file_name])
+		self.assertFalse(frappe.db.exists("File", doc.name))
+		self.assertFalse(os.path.exists(zip_copy))
+
+	# -- thumbnails and optimisation ----------------------------------------------------------
 
 	def test_thumbnail_skipped_for_private_r2_image(self):
 		doc = self.r2_file(f"thumb-{frappe.generate_hash(length=6)}.png", png_bytes())
@@ -881,36 +976,3 @@ class TestLocalFileAccess(R2TestCase):
 			doc.optimize_file()
 		self.assertIn("not available for files stored in Cloudflare R2", str(cm.exception))
 		self.assertEqual(frappe.get_doc("File", doc.name).get_raw_content(), content)
-
-	def test_unzip_r2_zip_through_temporary_copy(self):
-		members = {"a.txt": frappe.generate_hash().encode(), "b.bin": os.urandom(32)}
-		doc = self.r2_file(f"bundle-{frappe.generate_hash(length=6)}.zip", zip_bytes(members))
-		temp = TempPaths()
-		with temp.patch():
-			children = doc.unzip()
-		CREATED_FILES.extend(c.name for c in children)
-		commit()
-		self.assertEqual({c.file_name for c in children}, set(members))
-		for child in children:
-			fresh = frappe.get_doc("File", child.name)
-			self.assertTrue(key_from_url(fresh.file_url))
-			self.assertEqual(fresh.get_raw_content(), members[child.file_name])
-		self.assertFalse(frappe.db.exists("File", doc.name))
-		self.assertEqual(len(temp.paths), 1)
-		self.assertFalse(os.path.exists(temp.paths[0]))
-		self.assertFalse(doc.flags.r2_local_path)
-
-	# -- the GrowthOS pattern ---------------------------------------------------------------
-
-	def test_growthos_image_read_through_local_copy_and_raw_content(self):
-		from io import BytesIO
-
-		from PIL import Image
-
-		doc = self.r2_file(f"post-{frappe.generate_hash(length=6)}.png", png_bytes((64, 48)))
-		with doc.local_copy() as path:
-			with Image.open(path) as image:
-				image.load()
-				self.assertEqual(image.size, (64, 48))
-		with Image.open(BytesIO(doc.get_raw_content())) as image:
-			self.assertEqual(image.size, (64, 48))

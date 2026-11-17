@@ -23,6 +23,10 @@ LEGACY_S3_METHOD = "frappe_s3_attachment.controller.generate_file"
 
 MB = 1024 * 1024
 DEFAULT_IGNORED_DOCTYPES = ("Data Import",)
+# Always kept on the server disk, whatever the settings say: ERPNext writes back into these files
+# through File.get_full_path() (stock_ledger.py for Repost Item Valuation, write_files() for Bank
+# Statement Import). For an R2 file that path is a read-only cache copy, so the write would fail.
+WRITE_BACK_DOCTYPES = ("Repost Item Valuation", "Bank Statement Import")
 
 
 def _boto_config(**extra):
