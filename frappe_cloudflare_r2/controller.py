@@ -129,6 +129,8 @@ def finish_upload(doc, settings, r2, path, key, size, old_url, note=None):
 		(new_url, old_url),
 	)
 	doc.file_url = new_url
+	# if the request rolls back, File.on_rollback cleans up the server copy under this URL (overrides/file.py)
+	doc.flags.r2_uploaded_from = old_url
 	repoint_attached_field(doc, old_url, new_url)
 	log(
 		"Uploaded",

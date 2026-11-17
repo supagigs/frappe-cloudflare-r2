@@ -43,7 +43,7 @@ from local disk or the <a href="https://cloud.frappe.io/marketplace/apps/frappe_
 | **Local → R2** | One click. Background, batched, resumable. Server copies are deleted after upload. |
 | **S3 → R2** | One click. Reads settings from Frappe S3 Attachment automatically (editable). S3 originals are kept **30 days** (configurable), then deleted. Old S3 links stored in Frappe are rewritten. |
 | **References** | File records, every Attach / Attach Image field (all DocTypes, child tables, custom fields, Single settings like the website logo) and optionally links inside rich text are updated. |
-| **Content access** | Code that reads file bytes (email attachments, Data Import, Prepared Reports) keeps working for files in R2. |
+| **Content access** | Code that reads file bytes (email attachments, Data Import, Prepared Reports) keeps working for files in R2. Libraries that need a disk path use `file_doc.local_copy()` ([details](#for-app-developers-reading-r2-files)). |
 | **Exit path** | One click moves everything back to the server disk. |
 
 ## Install
@@ -194,15 +194,23 @@ Delete  ─► File.on_trash ─► after commit: copy to _trash/, delete origin
 - While Frappe S3 Attachment is still installed, its own upload hook also runs. Migrate, then uninstall it.
 - Another app that also overrides the `File` DocType class may conflict with this one.
 
-## For app developers: reading file bytes
+## For app developers: reading R2 files
 
-Once files live in R2, `open(file_doc.get_full_path())` no longer works, because the path is now a URL. Use:
+A file in R2 has no path on the server. `open(file_doc.get_full_path())` can't work for it, so `get_full_path()` raises `R2FileNotOnDiskError` (a `frappe.ValidationError`) with a clear message instead of returning the download URL. Read the file one of these ways:
 
 ```python
 content = file_doc.get_raw_content()   # exact bytes, from R2 or local disk
+
+with file_doc.local_copy() as path:    # a real path, for libraries that need one (PIL, PDF tools, zipfile)
+    image = Image.open(path)
+    image.load()                       # finish reading inside the block
 ```
 
-`get_content()` also works, but like Frappe's own version it may decode text-looking files to `str`.
+- `local_copy()` gives a local file's own path. For an R2 file it downloads a private temporary copy (mode 0600, same extension) and deletes it when the block ends, even on error. Don't keep the path.
+- Neither method checks permissions. Check `file_doc.has_permission("read")` first when the request comes from a user.
+- `get_content()` also works, but like Frappe's own version it may decode text-looking files to `str`.
+- `frappe.utils.file_manager.get_file()` and `get_file_path()` are module functions this app can't extend. For an R2 file, `get_file_path()` returns the URL, and `get_file()` fails with `[Errno 2]`. Use `frappe.get_doc("File", name).get_raw_content()` instead.
+- In the File form: Unzip works for R2 zip files. Optimize says it isn't available for R2 images. Private R2 images get no thumbnail.
 
 ## Development
 
@@ -214,7 +222,9 @@ bench --site test.local set-config allow_tests true
 bench --site test.local run-tests --app frappe_cloudflare_r2
 ```
 
-The tests run against a local S3-compatible server (moto), covering uploads, multipart uploads, signed downloads, permissions, trash and purge, and all three migrations including S3 retention and old S3 links.
+The tests run against a local S3-compatible server (moto), covering uploads, multipart uploads, signed downloads, permissions, trash and purge, reading R2 files through `local_copy()`, and all three migrations including S3 retention and old S3 links.
+
+The suite saves the site's Cloudflare R2 Settings and restores them afterwards, and removes only the records it creates. The migration, deferred-retry and log-purge tests act on every file on the site, so they run only in CI (`CI` set) or on a disposable site with `bench --site test.local set-config allow_site_wide_r2_tests 1`.
 
 ## Credits & License
 

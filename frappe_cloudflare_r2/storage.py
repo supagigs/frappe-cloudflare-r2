@@ -242,6 +242,10 @@ class R2:
 	def download_to(self, key, path, is_private=True):
 		self.client.download_file(self.bucket_for(is_private), key, path, Config=self.transfer_config())
 
+	def download_fileobj(self, key, fileobj, is_private=True):
+		"""Stream an object into an open binary file (keeps that file's permissions)."""
+		self.client.download_fileobj(self.bucket_for(is_private), key, fileobj, Config=self.transfer_config())
+
 	def exists(self, key, is_private=True):
 		from botocore.exceptions import ClientError
 
