@@ -13,6 +13,13 @@
   - **B, in this app:** add a supported temporary local copy, `with file_doc.local_copy() as path:`, for libraries that need a real path.
   - **D, in this app:** make path-based helpers fail with a clear message ("stored in R2; use get_raw_content()").
   - **C, not recommended without a design:** make `get_full_path()` return a cached copy. Frappe also uses that path to delete and validate files.
+- **Solution in brief:**
+  - When code asks an R2 file for its disk path, the R2 app hands back a real, private, read-only copy, downloaded on demand and cached. Code written for local storage then works unchanged.
+  - Saving, checking, deleting, trashing and rolling back still act on the object in R2.
+  - A daily job clears old copies.
+  - Two ERPNext doctypes that write back into their file stay on local disk.
+  - Only this app changes. Frappe, ERPNext, GrowthOS and the other apps are unchanged and benefit automatically.
+  - Status: built and tested on staging (36 passing), under review, not yet released.
 - **Requirement (user decision):** R2 replaces Frappe's default storage. Anything that works with local storage must keep working when R2 is on, in every app, and no other app will change. That rules out D on its own, and calls for C with a design.
 - **Resolution (1.0.1, branch `fix/r2-local-file-access`): C, built as a private cache. B is kept as the explicit API. A is no longer needed.**
   - **C, paths:** for an R2 file, `get_full_path()` returns `sites/<site>/private/r2_cache/<sha256("private"|"public":key)><ext>` (`cache.py`).
