@@ -95,6 +95,7 @@ def _move(row, r2, settings, run_id):
 			reference_name=row.file,
 		)
 		return False
+	frappe.db.release_savepoint(savepoint)
 	frappe.db.after_commit.add(cleanup.run)
 	return True
 

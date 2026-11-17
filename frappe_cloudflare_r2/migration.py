@@ -317,9 +317,10 @@ def _r2_to_local(row, r2, settings, after_commit=None):
 	key = key_from_url(row.file_url, settings)
 	if not key:
 		raise _Skip("Not an R2 URL")
-	# the key's side, not the row's: a private object must never land in public/files
-	is_private = side_for(key, row.is_private)
-	folder = frappe.get_site_path("private" if is_private else "public", "files")
+	# the bucket comes from the key alone; the local folder takes the stricter of key and row
+	in_private_bucket = side_for(key, row.is_private)
+	dest_private = in_private_bucket or cint(row.is_private)
+	folder = frappe.get_site_path("private" if dest_private else "public", "files")
 	os.makedirs(folder, exist_ok=True)
 	name = slug(row.file_name, "file")
 	base, ext = os.path.splitext(name)
@@ -328,15 +329,24 @@ def _r2_to_local(row, r2, settings, after_commit=None):
 		n += 1
 		name = f"{base}-{n}{ext}"
 	path = os.path.join(folder, name)
-	r2.download_to(key, path, is_private)
-	if is_private and not cint(row.is_private):
-		# a row made public after upload: the bytes are private, so the rows must be too
-		File = frappe.qb.DocType("File")
-		frappe.qb.update(File).set(File.is_private, 1).where(File.file_url == row.file_url).run()
-	cleanup = frappe.db.after_commit if after_commit is None else after_commit
-	cleanup.add(lambda: _try(r2.delete, key, is_private))
-	cleanup.add(lambda: cache.remove(key, is_private, row.file_name))
-	return ("/private/files/" if is_private else "/files/") + name, {"source": "Cloudflare R2", "r2_key": key}
+	try:
+		r2.download_to(key, path, in_private_bucket)
+		if dest_private:
+			# row is_private is aggregated by callers and unreliable: make every public row private
+			File = frappe.qb.DocType("File")
+			(
+				frappe.qb.update(File)
+				.set(File.is_private, 1)
+				.where(File.file_url == row.file_url)
+				.where(File.is_private == 0)
+			).run()
+		cleanup = frappe.db.after_commit if after_commit is None else after_commit
+		cleanup.add(lambda: _try(r2.delete, key, in_private_bucket))
+		cleanup.add(lambda: cache.remove(key, in_private_bucket, row.file_name))
+	except Exception:
+		_remove(path)  # our own download: the name was free before it
+		raise
+	return ("/private/files/" if dest_private else "/files/") + name, {"source": "Cloudflare R2", "r2_key": key}
 
 
 def _remove(path):
