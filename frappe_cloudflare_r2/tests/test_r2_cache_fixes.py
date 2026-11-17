@@ -282,8 +282,11 @@ class TestBucketFromKey(R2TestCase):
 
 		frappe.delete_doc("File", doc.name)
 		commit()
-		self.assertFalse(R2().exists(key, True))  # moved to trash in the private bucket
-		self.assertTrue(R2().exists(R2().trash_key(key), True))
+		r2 = R2()
+		self.assertFalse(r2.exists(key, True))  # moved to trash in the private bucket
+		# list, don't rebuild trash_key(): its stamp is per second, so it changes if the clock ticks
+		trashed = [o["Key"] for o in r2._iter_objects(base.R2_BUCKET, r2.trash_prefix()) if o["Key"].endswith(key)]
+		self.assertEqual(len(trashed), 1)
 		self.assertFalse(os.path.exists(path))
 
 	def test_r2_to_local_puts_a_private_key_under_private_files(self):
